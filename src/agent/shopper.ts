@@ -15,6 +15,7 @@ export interface ShopperProfile {
   buyer: Buyer;
   address: Address;
   card: VaultedCard;
+  stripePaymentMethod: string;
 }
 
 export function defaultShopper(): ShopperProfile {
@@ -30,6 +31,7 @@ export function defaultShopper(): ShopperProfile {
       holder: "Jane Doe",
       brand: "visa",
     },
+    stripePaymentMethod: env.AGENT_STRIPE_PAYMENT_METHOD || "pm_card_visa",
   };
 }
 

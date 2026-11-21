@@ -14,6 +14,13 @@ const mockBase = `http://localhost:${MOCK_PORT}`;
 const mockOnly = (value: string) => (mode === "mock" ? value : "");
 if (mode === "test" && !env.ADYEN_CHECKOUT_API_KEY) throw new Error("ADYEN_MODE=test needs ADYEN_CHECKOUT_API_KEY");
 
+export const MOCK_STRIPE_PORT = Number(env.MOCK_STRIPE_PORT || 8082);
+export const MOCK_STRIPE_KEY = "sk_test_mock";
+const stripeKey = env.STRIPE_SECRET_KEY || "";
+if (stripeKey.startsWith("sk_live_")) throw new Error("STRIPE_SECRET_KEY is a live key; live Shared Payment Tokens must come from a real agent platform, so this POC refuses to start");
+if (stripeKey && !stripeKey.startsWith("sk_test_")) throw new Error("STRIPE_SECRET_KEY must be a secret test key (sk_test_...)");
+const stripeMode = stripeKey ? "test" : "mock";
+
 export const config = {
   mode,
   companyAccount: env.ADYEN_COMPANY_ACCOUNT || "PocCompany",
@@ -43,7 +50,15 @@ export const config = {
   webhookInsecure: env.ADYEN_WEBHOOK_INSECURE === "1",
   googlePayMerchantId: env.GOOGLE_PAY_MERCHANT_ID || "BCR2DN4TEST000000",
   googlePayToken: env.GOOGLE_PAY_TOKEN || "",
-  protocol: oneOf("PROTOCOL", ["ucp", "acp"]),
+  protocol: oneOf("PROTOCOL", ["ucp", "acp", "stripe"]),
+  merchantAcpApiKey: env.MERCHANT_ACP_API_KEY || "mock_merchant_acp_key",
+  stripe: {
+    mode: stripeMode,
+    secretKey: stripeKey || MOCK_STRIPE_KEY,
+    apiBase: env.STRIPE_API_BASE || (stripeMode === "test" ? "https://api.stripe.com" : `http://localhost:${MOCK_STRIPE_PORT}`),
+    apiVersion: "2026-09-30.preview",
+    timeoutMs: Number(env.STRIPE_TIMEOUT_MS || 15_000),
+  },
 } as const;
 
 export function tracing(): boolean {

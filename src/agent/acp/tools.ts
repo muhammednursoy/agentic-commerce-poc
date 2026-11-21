@@ -4,7 +4,20 @@ import { itemsInput, itemsSchema, sessionIdSchema, stringInput, toolError } from
 import type { CheckoutSummary, Confirm, ToolDefinition, Toolset } from "../toolset.ts";
 import type { AgentPlatform } from "./platform.ts";
 
-const DEFINITIONS: ToolDefinition[] = [
+const PROVIDERS = {
+  adyen: {
+    host: "with the merchant through Adyen",
+    tokenize: "tokenize their saved card with Adyen (single-use token limited to this session and amount)",
+    role: "with Adyen as the payment provider",
+  },
+  stripe: {
+    host: "directly with the merchant",
+    tokenize: "have the agent platform grant the merchant a Stripe Shared Payment Token (single use, limited to this amount and 15 minutes)",
+    role: "hosted by the merchant, with Stripe as the payment provider",
+  },
+} as const;
+
+const definitions = (provider: keyof typeof PROVIDERS): ToolDefinition[] => [
   {
     name: "list_products",
     description: "List the merchant's product feed with ids, prices (minor units) and stock.",
@@ -13,7 +26,7 @@ const DEFINITIONS: ToolDefinition[] = [
   {
     name: "create_checkout_session",
     description:
-      "Create an ACP checkout session with the merchant through Adyen. The shopper's saved shipping address and contact details are attached automatically. Returns line items, shipping options, totals and messages.",
+      `Create an ACP checkout session ${PROVIDERS[provider].host}. The shopper's saved shipping address and contact details are attached automatically. Returns line items, shipping options, totals and messages.`,
     parameters: { type: "object", properties: { items: itemsSchema }, required: ["items"], additionalProperties: false },
   },
   {
@@ -39,7 +52,7 @@ const DEFINITIONS: ToolDefinition[] = [
   {
     name: "pay_and_complete",
     description:
-      "Ask the shopper to approve the exact total, then tokenize their saved card with Adyen (single-use token limited to this session and amount) and complete the checkout. Only call when the session is ready.",
+      `Ask the shopper to approve the exact total, then ${PROVIDERS[provider].tokenize} and complete the checkout. Only call when the session is ready.`,
     parameters: { type: "object", properties: { session_id: sessionIdSchema }, required: ["session_id"], additionalProperties: false },
   },
   {
@@ -51,7 +64,7 @@ const DEFINITIONS: ToolDefinition[] = [
 
 export class AcpToolset implements Toolset {
   readonly protocol = "acp";
-  readonly definitions = DEFINITIONS;
+  readonly definitions: ToolDefinition[];
   readonly names = { list: "list_products", create: "create_checkout_session", update: "update_checkout_session", pay: "pay_and_complete" };
   readonly system: string;
   private readonly platform: AgentPlatform;
@@ -61,9 +74,10 @@ export class AcpToolset implements Toolset {
   constructor(platform: AgentPlatform, confirm: Confirm) {
     this.platform = platform;
     this.confirm = confirm;
+    this.definitions = definitions(platform.endpoint.provider);
     const a = platform.shopper.address;
     this.system = [
-      "You are a shopping agent for the online store Brew & Co. You buy on the shopper's behalf through the Agentic Commerce Protocol (ACP) with Adyen as the payment provider.",
+      `You are a shopping agent for the online store Brew & Co. You buy on the shopper's behalf through the Agentic Commerce Protocol (ACP), ${PROVIDERS[platform.endpoint.provider].role}.`,
       "Work only with the tools. Never invent product ids, prices or shipping options; read them from tool results. Amounts in tool results are in minor units (cents); always show them to the shopper formatted, e.g. $28.99.",
       "Flow: list_products, create_checkout_session, pick a shipping option with update_checkout_session (standard unless the shopper asked for faster delivery), then pay_and_complete.",
       "If a tool result has error messages (out of stock, partial stock, unsupported destination, declined payment), explain it to the shopper and suggest an alternative instead of retrying blindly.",
@@ -113,7 +127,7 @@ export class AcpToolset implements Toolset {
       return token ? this.complete(sessionId, token) : { error: "payment is pending at the merchant", session: summary };
     }
     if (!summary.ready) return { error: `session is ${session.status}, not ready_for_payment`, session: summary };
-    const approved = await this.confirm(describeForApproval(summary, `card •••• ${this.platform.shopper.card.number.slice(-4)}`));
+    const approved = await this.confirm(describeForApproval(summary, this.platform.paymentLabel()));
     if (!approved) return { declined_by_shopper: true, session_id: sessionId };
     return this.complete(sessionId, await this.platform.delegatePayment(session));
   }

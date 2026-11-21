@@ -6,7 +6,9 @@ import { isValidNotification } from "../adyen-hmac.ts";
 import type { NotificationRequestItem } from "../adyen-hmac.ts";
 import type { Product } from "../domain.ts";
 import { registerAcpHooks } from "./acp-hooks.ts";
+import { AcpMerchant } from "./acp-server.ts";
 import { requestRefund } from "./adyen-checkout.ts";
+import { refundPaymentIntent } from "./stripe-payments.ts";
 import { MerchantStore } from "./store.ts";
 import { UcpMerchant } from "./ucp-server.ts";
 
@@ -16,11 +18,13 @@ const REFUNDS = "Brew & Co refund policy (POC). Unopened items can be returned w
 export class Merchant {
   readonly store: MerchantStore;
   readonly ucp: UcpMerchant;
+  readonly acp: AcpMerchant;
   readonly webhooks: NotificationRequestItem[] = [];
 
   constructor(products?: Product[]) {
     this.store = new MerchantStore(products);
     this.ucp = new UcpMerchant(this.store);
+    this.acp = new AcpMerchant(this.store);
   }
 
   get catalog() {
@@ -44,6 +48,7 @@ export class Merchant {
       .on("POST", "/adyen/webhooks", (r) => this.webhook(r));
     registerAcpHooks(router, this.store);
     this.ucp.register(router);
+    this.acp.register(router);
     return router;
   }
 
@@ -55,6 +60,13 @@ export class Merchant {
     const order = this.store.orders.get(id);
     if (!order) return { status: 404, body: { message: "order not found" } };
     if (order.refund) return { status: 409, body: { message: `a refund for this order is already ${order.refund.status}`, refund: order.refund } };
+    if (order.provider === "stripe") {
+      const refund = await refundPaymentIntent(order.pspReference, order.amount, `${order.id}-refund`);
+      if (!refund.id) return { status: 502, body: { message: `Stripe did not accept the refund: ${refund.failure}` } };
+      const status = refund.status === "succeeded" ? "refunded" : refund.status === "failed" || refund.status === "canceled" ? "failed" : "received";
+      order.refund ??= { pspReference: refund.id, amount: order.amount, status };
+      return { status: status === "received" ? 202 : 200, body: order.refund };
+    }
     const result = await requestRefund(order.pspReference, { value: order.amount, currency: order.currency }, order.id);
     if (!result.pspReference) return { status: 502, body: { message: `Adyen did not accept the refund: ${result.failure}` } };
     order.refund ??= { pspReference: result.pspReference, amount: order.amount, status: "received" };

@@ -1,14 +1,15 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { config } from "../../config.ts";
 import { callJson } from "../../http.ts";
 import type { CallResult } from "../../http.ts";
 import { sessionTotal } from "../../acp.ts";
+import { stripeCall } from "../../stripe-api.ts";
 import type { CheckoutSession } from "../../acp.ts";
 import type { Item, Product } from "../../domain.ts";
 import { defaultShopper } from "../shopper.ts";
 import type { ShopperProfile } from "../shopper.ts";
 
-export class AdyenApiError extends Error {
+export class AcpApiError extends Error {
   readonly status: number;
   readonly body: unknown;
 
@@ -19,11 +20,60 @@ export class AdyenApiError extends Error {
   }
 }
 
+export interface AcpEndpoint {
+  provider: "adyen" | "stripe";
+  sessionsUrl: string;
+  apiKey: string;
+  label: string;
+}
+
+export function adyenCommerceSuite(): AcpEndpoint {
+  return {
+    provider: "adyen",
+    sessionsUrl: `${config.commerceSuiteBase}/${encodeURIComponent(config.companyAccount)}/checkout_sessions`,
+    apiKey: config.commerceSuiteApiKey,
+    label: "agent→adyen acp",
+  };
+}
+
+export function merchantHostedAcp(): AcpEndpoint {
+  return { provider: "stripe", sessionsUrl: `${config.merchantUrl}/acp/checkout_sessions`, apiKey: config.merchantAcpApiKey, label: "agent→merchant acp" };
+}
+
+export interface SharedTokenLimits {
+  paymentMethod: string;
+  currency: string;
+  maxAmount: number;
+  expiresAt: number;
+}
+
+export async function grantSharedPaymentToken(limits: SharedTokenLimits): Promise<string> {
+  const res = await stripeCall("POST", "/v1/test_helpers/shared_payment/granted_tokens", {
+    label: "agent platform→stripe test helper",
+    form: {
+      payment_method: limits.paymentMethod,
+      "usage_limits[currency]": limits.currency.toLowerCase(),
+      "usage_limits[max_amount]": String(limits.maxAmount),
+      "usage_limits[expires_at]": String(limits.expiresAt),
+    },
+  });
+  if (res.status !== 200 || typeof res.body?.id !== "string") throw new AcpApiError("grant_shared_payment_token", res);
+  return res.body.id;
+}
+
 export class AgentPlatform {
   readonly shopper: ShopperProfile;
+  readonly endpoint: AcpEndpoint;
 
-  constructor(shopper: ShopperProfile = defaultShopper()) {
+  constructor(shopper: ShopperProfile = defaultShopper(), endpoint: AcpEndpoint = adyenCommerceSuite()) {
     this.shopper = shopper;
+    this.endpoint = endpoint;
+  }
+
+  paymentLabel(): string {
+    return this.endpoint.provider === "stripe"
+      ? `card via Stripe, test PaymentMethod ${this.shopper.stripePaymentMethod}`
+      : `card •••• ${this.shopper.card.number.slice(-4)}`;
   }
 
   async listProducts(): Promise<Product[]> {
@@ -54,12 +104,22 @@ export class AgentPlatform {
 
   completeSession(id: string, token: string): Promise<CheckoutSession> {
     return this.commerce("POST", `/${id}/complete`, "complete_checkout_session", {
-      payment_data: { provider: "adyen", token },
+      payment_data: { provider: this.endpoint.provider, token },
       buyer: this.shopper.buyer,
+    }, { "idempotency-key": `complete-${id}-${createHash("sha256").update(token).digest("hex").slice(0, 16)}` });
+  }
+
+  delegatePayment(session: CheckoutSession, ttlMinutes = 15): Promise<string> {
+    if (this.endpoint.provider !== "stripe") return this.delegateToAdyen(session, ttlMinutes);
+    return grantSharedPaymentToken({
+      paymentMethod: this.shopper.stripePaymentMethod,
+      currency: session.currency,
+      maxAmount: sessionTotal(session),
+      expiresAt: Math.floor(Date.now() / 1000) + ttlMinutes * 60,
     });
   }
 
-  async delegatePayment(session: CheckoutSession, ttlMinutes = 15): Promise<string> {
+  private async delegateToAdyen(session: CheckoutSession, ttlMinutes: number): Promise<string> {
     const card = this.shopper.card;
     const address = this.shopper.address;
     const res = await callJson("POST", `${config.palBase}/agentic_commerce/delegate_payment`, {
@@ -108,18 +168,17 @@ export class AgentPlatform {
         metadata: {},
       },
     });
-    if (res.status !== 200 && res.status !== 201) throw new AdyenApiError("delegate_payment", res);
+    if (res.status !== 200 && res.status !== 201) throw new AcpApiError("delegate_payment", res);
     return res.body.id;
   }
 
-  private async commerce(method: string, suffix: string, operation: string, body?: unknown): Promise<CheckoutSession> {
-    const url = `${config.commerceSuiteBase}/${encodeURIComponent(config.companyAccount)}/checkout_sessions${suffix}`;
-    const res = await callJson(method, url, {
-      label: "agent→adyen acp",
-      headers: { authorization: `Bearer ${config.commerceSuiteApiKey}` },
+  private async commerce(method: string, suffix: string, operation: string, body?: unknown, headers: Record<string, string> = {}): Promise<CheckoutSession> {
+    const res = await callJson(method, `${this.endpoint.sessionsUrl}${suffix}`, {
+      label: this.endpoint.label,
+      headers: { authorization: `Bearer ${this.endpoint.apiKey}`, ...headers },
       body,
     });
-    if (res.status !== 200 && res.status !== 201) throw new AdyenApiError(operation, res);
+    if (res.status !== 200 && res.status !== 201) throw new AcpApiError(operation, res);
     return res.body;
   }
 }

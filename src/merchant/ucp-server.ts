@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { config } from "../config.ts";
-import { randomId } from "../http.ts";
+import { IdempotencyCache, randomId } from "../http.ts";
 import type { Json, Req, Res, Router } from "../http.ts";
 import {
   CHECKOUT_CAPABILITY,
@@ -25,14 +25,14 @@ import type {
   UcpTotal,
 } from "../ucp.ts";
 import type { Address, Item } from "../domain.ts";
-import { isOutcomeUnknown, makePayment } from "./adyen-checkout.ts";
-import type { PaymentResult } from "./adyen-checkout.ts";
+import { makePayment } from "./adyen-checkout.ts";
+import { CHALLENGE_RESULTS, isOutcomeUnknown } from "./payment-outcome.ts";
+import type { PaymentResult } from "./payment-outcome.ts";
 import { RISK_LIMIT } from "./store.ts";
 import type { Consent, MerchantStore, PriceProblem } from "./store.ts";
 
 export const UCP_BASE_PATH = "/ucp/v1";
 const SESSION_TTL_MS = 6 * 60 * 60 * 1000;
-const CHALLENGE_RESULTS = new Set(["RedirectShopper", "IdentifyShopper", "ChallengeShopper"]);
 
 interface SessionState {
   id: string;
@@ -95,7 +95,7 @@ export function googlePayHandler(): GooglePayHandler {
 export class UcpMerchant {
   readonly sessions = new Map<string, SessionState>();
   private readonly store: MerchantStore;
-  private readonly idempotency = new Map<string, { hash: string; res: Res }>();
+  private readonly idempotency = new IdempotencyCache();
 
   constructor(store: MerchantStore) {
     this.store = store;
@@ -131,18 +131,12 @@ export class UcpMerchant {
 
   private async guard(req: Req, next: () => Res | Promise<Res>): Promise<Res> {
     if (!req.headers["ucp-agent"]) return fail(400, "missing_header", "UCP-Agent header is required");
-    const key = req.headers["idempotency-key"];
-    if (req.method === "GET" || typeof key !== "string") return next();
-    const scope = `${req.method} ${req.path} ${key}`;
-    const hash = createHash("sha256").update(JSON.stringify(req.body ?? {})).digest("hex");
-    const seen = this.idempotency.get(scope);
-    if (seen) {
-      if (seen.hash !== hash) return fail(409, "idempotency_conflict", "Idempotency-Key reused with a different body");
-      return seen.res;
-    }
-    const res = await next();
-    if (res.status < 500 && res.status !== 409 && res.body?.status !== "complete_in_progress") this.idempotency.set(scope, { hash, res });
-    return res;
+    return this.idempotency.run(
+      req,
+      next,
+      () => fail(409, "idempotency_conflict", "Idempotency-Key reused with a different body"),
+      (res) => res.status < 500 && res.status !== 409 && res.body?.status !== "complete_in_progress",
+    );
   }
 
   private create(req: Req): Res {
@@ -298,6 +292,7 @@ export class UcpMerchant {
       const order = this.store.recordOrder({
         id: pending.orderId,
         protocol: "ucp",
+        provider: "adyen",
         checkoutSessionId: state.id,
         pspReference: result.pspReference,
         amount: pending.total,

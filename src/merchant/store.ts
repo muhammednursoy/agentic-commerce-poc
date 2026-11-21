@@ -25,6 +25,7 @@ export interface Refund {
 export interface MerchantOrder {
   id: string;
   protocol: "acp" | "ucp";
+  provider: "adyen" | "stripe";
   checkoutSessionId: string;
   pspReference: string;
   amount: number;

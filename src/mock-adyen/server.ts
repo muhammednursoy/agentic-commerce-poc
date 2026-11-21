@@ -3,8 +3,8 @@ import type http from "node:http";
 import { config } from "../config.ts";
 import { Router, callJson, pspReference, randomId } from "../http.ts";
 import type { Json, Req, Res } from "../http.ts";
-import { sessionTotal } from "../acp.ts";
-import type { CheckoutSession, Message, Quote } from "../acp.ts";
+import { applyQuote, errorMessage as error, infoMessage as info, sessionTotal, validateItems } from "../acp.ts";
+import type { CheckoutSession, Quote } from "../acp.ts";
 import { signNotification } from "../adyen-hmac.ts";
 import type { NotificationRequestItem } from "../adyen-hmac.ts";
 import { decodeMockGooglePayToken } from "../google-pay-mock.ts";
@@ -144,19 +144,7 @@ export class MockAdyen {
         discounts,
       },
     }) as { body: Quote };
-    session.line_items = quote.line_items;
-    session.fulfillment_options = quote.fulfillment_options;
-    session.totals = quote.totals;
-    session.messages = quote.messages;
-    if (session.fulfillment_option_id && !quote.fulfillment_options.some((o) => o.id === session.fulfillment_option_id)) {
-      session.fulfillment_option_id = undefined;
-    }
-    const hasError = quote.messages.some((m) => m.type === "error") || quote.line_items.length === 0;
-    const missing: Message[] = [];
-    if (!session.fulfillment_address) missing.push(info("missing_fulfillment_address", "Provide a fulfillment_address to calculate shipping and tax."));
-    else if (!session.fulfillment_option_id) missing.push(info("missing_fulfillment_option", "Choose one of fulfillment_options via fulfillment_option_id."));
-    session.messages.push(...missing);
-    session.status = !hasError && missing.length === 0 ? "ready_for_payment" : "not_ready_for_payment";
+    applyQuote(session, quote);
   }
 
   private async completeSession(req: Req): Promise<Res> {
@@ -447,24 +435,6 @@ export class MockAdyen {
     this.payments.push(payment);
     return { status: 200, body: payment };
   }
-}
-
-function validateItems(items: Json): string[] {
-  if (!Array.isArray(items) || items.length === 0) return ["items"];
-  return items.flatMap((it: Json, i: number) => {
-    const out: string[] = [];
-    if (typeof it?.id !== "string") out.push(`items[${i}].id`);
-    if (!Number.isInteger(it?.quantity) || it.quantity < 1) out.push(`items[${i}].quantity`);
-    return out;
-  });
-}
-
-function error(code: string, content: string, path?: string): Message {
-  return { type: "error", code, content, content_type: "plain", ...(path ? { path } : {}) };
-}
-
-function info(code: string, content: string): Message {
-  return { type: "info", code, content, content_type: "plain" };
 }
 
 function notFound(): Res {

@@ -13,7 +13,7 @@ const { config } = await import("../src/config.ts");
 const { callJson } = await import("../src/http.ts");
 const { MockAdyen } = await import("../src/mock-adyen/server.ts");
 const { Merchant } = await import("../src/merchant/server.ts");
-const { AgentPlatform, AdyenApiError } = await import("../src/agent/acp/platform.ts");
+const { AgentPlatform, AcpApiError } = await import("../src/agent/acp/platform.ts");
 const { defaultShopper } = await import("../src/agent/shopper.ts");
 const { AcpToolset } = await import("../src/agent/acp/tools.ts");
 const { ScriptedAgent, pickItems } = await import("../src/agent/llm/scripted.ts");
@@ -315,12 +315,12 @@ describe("agent end to end", () => {
     assert.equal(approvals, 1);
   });
 
-  test("delegate errors surface as AdyenApiError", async () => {
+  test("delegate errors surface as AcpApiError", async () => {
     const shopper = defaultShopper();
     shopper.card = { ...shopper.card, number: "41" };
     const platform = new AgentPlatform(shopper);
     const session = await readySession(platform);
-    await assert.rejects(platform.delegatePayment(session), AdyenApiError);
+    await assert.rejects(platform.delegatePayment(session), AcpApiError);
   });
 });
 

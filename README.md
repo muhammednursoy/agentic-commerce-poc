@@ -1,22 +1,85 @@
-# Agentic payments with Adyen: Gemini + Google UCP, and ACP
+# Agentic payments: ACP with Stripe Shared Payment Tokens, Google UCP, and ACP via Adyen
 
-**Question:** can an AI agent pay a merchant whose backend runs on Adyen?
-**Short answer from this repo:** the merchant side is small. An agent purchase ends as an ordinary Adyen `POST /payments` call. But the default run proves only the design: the agent, Google Pay and Adyen are all stand-ins.
+**Question:** can an AI agent pay a merchant, and how small is the merchant side?
+**Short answer from this repo:** small. An agent purchase ends as one ordinary payment call: a Stripe PaymentIntent confirmed with a Shared Payment Token, or an Adyen `POST /payments`. The **Stripe path runs against the real Stripe test API** (`npm run stripe:live`). The Adyen paths run only against a local mock, because Adyen test signup is closed.
 
 > **What this proves / what it does not**
 >
 > | Proven by running this repo | Not proven |
 > |---|---|
+> | **Real provider:** a merchant-hosted ACP checkout charges a Stripe Shared Payment Token (SPT) as a real PaymentIntent in Stripe **test mode**, visible in the Dashboard. Refunds go to the real `/v1/refunds` | The SPT is granted by Stripe's **test helper**, standing in for the agent platform (for example OpenAI/ChatGPT). No real agent platform has issued a token to this merchant. Live keys are refused |
+> | Stripe enforces the token's limits: single use, `max_amount`, expiry. A declined card is recoverable with a new token | Stripe webhooks (`payment_intent.*`, `shared_payment.granted_token.deactivated`) are not wired. An unknown outcome is resolved only by the agent's retry |
 > | A merchant backend can expose Google UCP checkout and charge a Google Pay token through Adyen's documented `/payments` shape | No money, test or real, has moved through Adyen. Every `Authorised` comes from the local mock |
-> | The LLM never sees card data. The shopper approves the exact total, and a changed total is refused | The default demo has **no LLM**: it uses a scripted keyword matcher. Gemini and Claude run only with an API key |
-> | Unknown Adyen outcomes (timeouts, 5xx) never double-charge. Retries resend the same idempotency key | Google has never called this merchant. Gemini or AI Mode needs Google onboarding and a public HTTPS endpoint |
+> | The LLM never sees card data or the SPT. The shopper approves the exact total, and a changed total is refused | The default demo has **no LLM**: it uses a scripted keyword matcher. Gemini and Claude run only with an API key |
+> | Unknown outcomes (timeouts, 5xx) never double-charge, on Stripe and Adyen alike. Retries resend the same idempotency key | Google has never called this merchant. Gemini or AI Mode needs Google onboarding and a public HTTPS endpoint |
 > | Each order stores a consent record (what was approved, when, shipped where, paid how) | The approval screen is simulated. In production Google owns it, not the merchant |
 > | Refunds go back to Adyen, and the `REFUND` webhook marks the order refunded (mock) | 3-D Secure is detected but cannot be completed. Capture, disputes and settlement are absent |
 > | ACP: the same purchase through a mock of Adyen's Commerce Suite | ACP hook paths differ from Adyen's merchant page (see the ACP section). Adyen must enable ACP per account |
 >
-> **Default run = scripted agent + mocked Google Pay + mocked Adyen.** The smallest real proof is one real Google Pay **test** token charged against Adyen's **test** environment ([below](#against-adyens-test-environment)). That needs about a day and nobody's permission.
+> **Real provider run = `npm run stripe:live`:** a scripted agent, a merchant-hosted ACP checkout and a real Stripe test-mode PaymentIntent. It needs only a `sk_test_` key. **Default run (`npm run demo`) = scripted agent + mocked Google Pay + mocked Adyen.**
 
-## The purchase, step by step
+## Real provider: ACP checkout hosted by the merchant, paid with a Stripe Shared Payment Token
+
+This is how ACP works with Stripe and OpenAI. The seller implements the ACP checkout API itself. The agent platform keeps the shopper's card and delegates payment as a Shared Payment Token: single use, scoped to this seller, capped by `max_amount`, and expiring. The seller charges the token with an ordinary PaymentIntent. Stripe docs: [Shared Payment Tokens](https://docs.stripe.com/agentic-commerce/concepts/shared-payment-tokens) (seller view: `?agent-seller=seller`).
+
+```bash
+# .env: STRIPE_SECRET_KEY=sk_test_...   (the account needs the agentic commerce preview)
+npm run stripe:live          # starts the merchant, runs the scripted agent, prints the PaymentIntent
+```
+
+It ends with something like:
+
+```
+PaymentIntent:  pi_3U...
+status:         succeeded
+dashboard:      https://dashboard.stripe.com/test/payments/pi_3U...
+```
+
+To chat instead, run `PROTOCOL=stripe npm run servers`, then `PROTOCOL=stripe npm run agent -- "Buy 2 bags of the coffee beans and a pack of paper filters"` (add `--yes` to auto-approve). Without `STRIPE_SECRET_KEY`, the same commands use a local mock Stripe on port 8082, and `npm test` always does.
+
+```mermaid
+sequenceDiagram
+    actor S as Shopper
+    participant A as Agent platform<br/>(scripted · Gemini · Claude)
+    participant M as Merchant backend<br/>ACP API (this repo)
+    participant T as Stripe<br/>(test mode)
+    S->>A: "Buy 2 bags of coffee beans and filters"
+    A->>M: POST /acp/checkout_sessions, then update with the shipping option
+    M-->>A: ready_for_payment, line items, totals
+    A->>S: Approve $76.73?
+    S-->>A: Approve
+    A->>T: test helper: grant SPT (max_amount = $76.73, expires in 15 min)
+    T-->>A: spt_...
+    A->>M: POST /acp/checkout_sessions/{id}/complete<br/>payment_data { provider: stripe, token: spt_... }
+    M->>T: POST /v1/payment_intents (amount, SPT, confirm, metadata, Idempotency-Key)
+    T-->>M: succeeded
+    M-->>A: completed + order (consent record stored)
+```
+
+| | Real | Simulated |
+|---|---|---|
+| Stripe API calls (`/v1/payment_intents`, `/v1/refunds`) | yes, Stripe test mode with header `Stripe-Version: 2026-09-30.preview` | |
+| PaymentIntents and refunds | yes, visible in the Stripe Dashboard (test mode) | |
+| Token limits: single use, `max_amount`, expiry | enforced by Stripe | |
+| The SPT grant | | `POST /v1/test_helpers/shared_payment/granted_tokens` with the seller's own test key, standing in for the agent platform. In production the agent platform (for example OpenAI) creates the token from the shopper's saved card; the seller never calls this |
+| The shopper's card | | Stripe test PaymentMethod `pm_card_visa` (`AGENT_STRIPE_PAYMENT_METHOD`) |
+| The agent and the approval screen | | scripted agent, auto-approved in `stripe:live`; in production the platform owns both |
+
+**Merchant ACP API** (bearer `MERCHANT_ACP_API_KEY`, default `mock_merchant_acp_key`): `POST /acp/checkout_sessions`, `GET|POST /acp/checkout_sessions/:id`, `POST /acp/checkout_sessions/:id/complete` (with `Idempotency-Key`), `POST /acp/checkout_sessions/:id/cancel`. Statuses: `not_ready_for_payment`, `ready_for_payment`, `in_progress`, `completed`, `canceled`. Pricing, stock, the risk limit and the consent record are the same code as the Adyen ACP hooks.
+
+**Outcomes of the PaymentIntent** (amount = the approved session total, `metadata` = `checkout_session_id`, `order_id`, `agent_protocol: ACP`, idempotency key `<session>-<order>`, fixed per payment attempt):
+
+- `succeeded` → `completed` with `order`. The order stores the `pi_...` and the consent record.
+- `requires_action` → back to `ready_for_payment` with a `requires_3ds` message. Nothing is charged; 3DS completion is not built.
+- 4xx `card_error` (decline) or `invalid_request_error` (token used, expired, or over `max_amount`) → `ready_for_payment` with a recoverable `payment_declined` message. The agent asks the shopper to approve again and gets a new token.
+- Timeout, network error, 5xx or 429 → stays `in_progress` with an info `payment_pending` message, stock stays reserved, and `cancel` is refused. Completing again with the same token resends the identical PaymentIntent request with the same idempotency key, so Stripe returns the first result instead of charging twice. The pay tool does this itself, without asking the shopper again. A different token gets 409.
+- Other 4xx (bad API key, idempotency conflict) → `payment_failed`, nothing charged.
+
+**Refund:** `POST /orders/:id/refund` on a Stripe order calls `POST /v1/refunds` with `payment_intent`. A synchronous `succeeded` sets `order.refund.status` to `refunded` and answers 200.
+
+Checked live against the Stripe test API on 2026-11-21: grant, charge, reuse (400 "already in a deactivated state"), over-limit (400 "greater than the remaining amount capturable"), `pm_card_chargeDeclined` (402 `card_error` `card_declined`; the token stays active afterwards), `pm_card_authenticationRequired` (200 `requires_action`, `next_action.type: shared_payment_token_action`), refund. The local mock (`src/mock-stripe/server.ts`) reproduces these responses.
+
+## The purchase, step by step (Google UCP, mocked)
 
 ```mermaid
 sequenceDiagram
@@ -60,9 +123,11 @@ Requires Node 23.6+ (TypeScript runs natively, no build step).
 
 ```bash
 npm install
+npm run stripe:live          # real provider: ACP + Stripe SPT against Stripe test mode (needs sk_test_ key)
 npm run demo                 # UCP + Google Pay, scripted agent, auto-approved, full HTTP trace
-PROTOCOL=acp npm run demo    # same purchase over ACP
-npm test                     # 80 tests: contract, end to end, HMAC vectors, config, LLM loops
+PROTOCOL=acp npm run demo    # same purchase over ACP via the Adyen mock
+PROTOCOL=stripe npm run demo # merchant-hosted ACP + Stripe (mock Stripe unless STRIPE_SECRET_KEY is set)
+npm test                     # 97 tests, all offline: contract, end to end, HMAC vectors, config, LLM loops, Stripe SPT
 ```
 
 To chat with a real agent, start the servers with `npm run servers`. Then, in another terminal:
@@ -77,9 +142,9 @@ GEMINI_API_KEY=... npm run agent -- "2 paket kahve çekirdeği ve filtre kağıd
 | `claude` | paid API usage | `ANTHROPIC_API_KEY` |
 | `scripted` | free, no LLM | none; deterministic keyword matcher used by tests |
 
-`GEMINI_MODEL` / `CLAUDE_MODEL` override the model. If the free tier rejects a model with a quota error, try `GEMINI_MODEL=gemini-3.5-flash-lite`. `ADYEN_MODE` (`mock` | `test`), `PROTOCOL` (`ucp` | `acp`) and `MERCHANT_FLOW` (`advanced` | `standard`) reject any other value at startup.
+`GEMINI_MODEL` / `CLAUDE_MODEL` override the model. If the free tier rejects a model with a quota error, try `GEMINI_MODEL=gemini-3.5-flash-lite`. `ADYEN_MODE` (`mock` | `test`), `PROTOCOL` (`ucp` | `acp` | `stripe`) and `MERCHANT_FLOW` (`advanced` | `standard`) reject any other value at startup. `STRIPE_SECRET_KEY` must start with `sk_test_` (real Stripe test API) or be unset (local mock); a `sk_live_` key refuses to start, because live SPTs must come from a real agent platform. `STRIPE_API_BASE` overrides the Stripe host.
 
-Mock test cards (set `AGENT_TEST_CARD`): `…1111` is authorised, `…0002` is refused for insufficient balance, and `…0044` triggers a 3-D Secure challenge (UCP: `requires_escalation`). Other things to try in chat: the out-of-stock gooseneck kettle, express shipping, changing quantities, closing the Google Pay sheet.
+Stripe test PaymentMethods (set `AGENT_STRIPE_PAYMENT_METHOD`, real and mock): `pm_card_visa` succeeds, `pm_card_chargeDeclined` is declined, `pm_card_authenticationRequired` needs 3DS. Adyen mock test cards (set `AGENT_TEST_CARD`): `…1111` is authorised, `…0002` is refused for insufficient balance, and `…0044` triggers a 3-D Secure challenge (UCP: `requires_escalation`). Other things to try in chat: the out-of-stock gooseneck kettle, express shipping, changing quantities, closing the Google Pay sheet.
 
 ## Google UCP flow in detail
 
@@ -102,7 +167,7 @@ Mock test cards (set `AGENT_TEST_CARD`): `…1111` is authorised, `…0002` is r
    - Stock is reserved during the Adyen call, so concurrent checkouts cannot oversell. Only a definitive result releases a reservation.
 6. **Webhook.** The merchant verifies the HMAC signature. An `AUTHORISATION` webhook settles a pending payment only when its amount and currency match the pending payment. Without `ADYEN_HMAC_KEY`, every webhook is rejected (`ADYEN_WEBHOOK_INSECURE=1` opts out).
 
-## ACP flow
+## ACP flow via Adyen (mock)
 
 Adyen docs: [Agentic Cart API integration (merchant side)](https://docs.adyen.com/online-payments/agentic-commerce/merchant/agentic-cart-api-integration), and [AI agent integration with ACP (agent-platform side)](https://docs.adyen.com/online-payments/agentic-commerce/agent-platform/ai-agent-integration-acp).
 
@@ -115,7 +180,7 @@ ACP webhooks are only attached to orders; they do not settle a pending ACP payme
 ## After the order
 
 - **Consent record.** `GET /orders/:id` returns `consent`: the protocol, the checkout id, the approved line items (before tax), subtotal, shipping, tax and total, the shipping address, the buyer email, the payment label (for example `Google Pay VISA •••• 1111`) and `approvedAt`. `approvedAt` is when the merchant received the approved completion (UCP complete, ACP commit); the platform sends no timestamp of its own.
-- **Refund.** `POST /orders/:id/refund` refunds the full amount with Adyen `POST /payments/{pspReference}/refunds` (idempotency key `<order>-refund`). It answers 202 `received`, and the `REFUND` webhook then sets `order.refund.status` to `refunded` or `failed`. A second refund is refused with 409. The checkout's `terms_of_service` and `refund_policy` links (`/terms`, `/refunds`) serve placeholder text.
+- **Refund.** For Stripe orders, see the Stripe section. For Adyen orders, `POST /orders/:id/refund` refunds the full amount with Adyen `POST /payments/{pspReference}/refunds` (idempotency key `<order>-refund`). It answers 202 `received`, and the `REFUND` webhook then sets `order.refund.status` to `refunded` or `failed`. A second refund is refused with 409. The checkout's `terms_of_service` and `refund_policy` links (`/terms`, `/refunds`) serve placeholder text.
 
 ## Against Adyen's test environment
 
@@ -155,6 +220,7 @@ Our guess, to confirm before production:
 
 ## Before production
 
+- **Stripe:** a webhook endpoint with signature verification for `payment_intent.succeeded` / `payment_intent.payment_failed` (to settle an `in_progress` session without the agent's retry) and `shared_payment.granted_token.deactivated`. ACP request signing and `API-Version` negotiation on the merchant ACP API. A real agent platform (for example OpenAI) as the token issuer, which ends the use of the test helper. The official `stripe` Node library behind the existing outcome mapping.
 - **Payment attempts:** one persistent `PaymentAttempt` store shared by UCP and ACP, so webhooks can settle ACP too. Sessions, reservations (conditional decrement), orders and the idempotency cache move into the same database. Store the reference, amount and token hash, never the payment credential.
 - **Webhooks:** a durable queue after HMAC verification, with dedupe, explicit handling of unknown references, and a reconciliation job for payments stuck in `complete_in_progress`. Handle `CAPTURE`, `CANCELLATION` and `CHARGEBACK`.
 - **Adyen:** the official Node library for Checkout and HMAC, behind the existing outcome classification. Contract tests from recorded test-mode traffic. Live-endpoint URL prefix.
@@ -171,22 +237,28 @@ Our guess, to confirm before production:
 src/
   domain.ts                   neutral types: Item, Address, Buyer, Product, formatAmount
   ucp.ts, acp.ts              protocol wire types
-  config.ts, http.ts          env (validated), JSON router, traced fetch with card redaction
+  config.ts, http.ts          env (validated), JSON/form router, traced fetch with card and SPT redaction, idempotency cache
+  stripe-api.ts               Stripe auth, Stripe-Version header, form-encoded calls
+  stripe-live.ts              npm run stripe:live
   adyen-hmac.ts               webhook HMAC sign/verify
   google-pay-mock.ts          mock Google Pay token format
   mock-adyen/server.ts        fake Checkout /payments + refunds, ACP Commerce Suite, PAL, webhooks
+  mock-stripe/server.ts       fake SPT test helper, token retrieve, PaymentIntents, refunds
   merchant/
     store.ts                  catalog, pricing, tax, shipping, orders with consent and refund
     ucp-server.ts             /.well-known/ucp and UCP checkout sessions
-    acp-hooks.ts              quote/commit/finalize hooks Adyen calls for ACP
+    acp-hooks.ts              quote/commit/finalize hooks Adyen calls for ACP; shared ACP pricing and approval
+    acp-server.ts             merchant-hosted ACP checkout API (/acp/checkout_sessions) for Stripe
     adyen-checkout.ts         /payments and refund client
+    stripe-payments.ts        PaymentIntent with an SPT, refund client
+    payment-outcome.ts        provider-neutral result codes and unknown-outcome classification
     server.ts                 routes, refunds, webhook receiver
   agent/
     ucp/                      UCP client, Google Pay sheet, tools
-    acp/                      ACP client (Commerce Suite + delegate_payment), tools
+    acp/                      ACP client (Adyen Commerce Suite or merchant-hosted), delegate_payment or SPT grant, tools
     llm/                      Gemini, Claude, scripted agents
     cli.ts, factory.ts, shopper.ts, toolset.ts
-test/ucp.test.ts, acp.test.ts, unit.test.ts, llm.test.ts, helpers.ts
+test/ucp.test.ts, acp.test.ts, stripe.test.ts, unit.test.ts, llm.test.ts, helpers.ts
 ```
 
-All data is fake. Do not put real card numbers or real Google Pay tokens in this repo.
+All data is fake. Do not put real card numbers, real Google Pay tokens or Stripe keys in this repo; `.env` is git-ignored.

@@ -1,5 +1,6 @@
 import { config } from "../config.ts";
-import { AgentPlatform } from "./acp/platform.ts";
+import { AgentPlatform, merchantHostedAcp } from "./acp/platform.ts";
+import { defaultShopper } from "./shopper.ts";
 import { AcpToolset } from "./acp/tools.ts";
 import { ClaudeAgent } from "./llm/claude.ts";
 import { GeminiAgent } from "./llm/gemini.ts";
@@ -9,8 +10,15 @@ import type { Confirm, Toolset } from "./toolset.ts";
 import { UcpPlatform } from "./ucp/platform.ts";
 import { UcpToolset } from "./ucp/tools.ts";
 
-export function createToolset(confirm: Confirm, protocol: "acp" | "ucp" = config.protocol): Toolset {
-  return protocol === "acp" ? new AcpToolset(new AgentPlatform(), confirm) : new UcpToolset(new UcpPlatform(), confirm);
+export function createToolset(confirm: Confirm, protocol: "acp" | "ucp" | "stripe" = config.protocol): Toolset {
+  switch (protocol) {
+    case "acp":
+      return new AcpToolset(new AgentPlatform(), confirm);
+    case "stripe":
+      return new AcpToolset(new AgentPlatform(defaultShopper(), merchantHostedAcp()), confirm);
+    default:
+      return new UcpToolset(new UcpPlatform(), confirm);
+  }
 }
 
 export function createAgent(options: AgentOptions, provider = process.env.LLM_PROVIDER): ChatAgent {

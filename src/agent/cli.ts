@@ -22,7 +22,10 @@ const agent = createAgent({
   onToolCall: (name, input) => console.log(`\x1b[36m⚙ ${name}\x1b[0m ${JSON.stringify(input)}`),
 });
 
-console.log(`agent: ${agent.label} | protocol: ${toolset.protocol} | adyen: ${config.mode}${toolset.protocol === "acp" ? ` | merchant flow: ${config.merchantFlow}` : ""}`);
+const provider = config.protocol === "stripe"
+  ? `stripe: ${config.stripe.mode}`
+  : `adyen: ${config.mode}${toolset.protocol === "acp" ? ` | merchant flow: ${config.merchantFlow}` : ""}`;
+console.log(`agent: ${agent.label} | protocol: ${toolset.protocol} | ${provider}`);
 let message = firstMessage || (await rl.question("you> "));
 while (message.trim()) {
   try {

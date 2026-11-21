@@ -1,5 +1,5 @@
 import http from "node:http";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { tracing } from "./config.ts";
 
 export type Json = any;
@@ -47,7 +47,8 @@ export class Router {
       const raw = Buffer.concat(chunks).toString("utf8");
       let out: Res;
       try {
-        const body = raw ? JSON.parse(raw) : undefined;
+        const form = req.headers["content-type"]?.includes("application/x-www-form-urlencoded");
+        const body = !raw ? undefined : form ? Object.fromEntries(new URLSearchParams(raw)) : JSON.parse(raw);
         out = await this.dispatch(req.method ?? "GET", url.pathname, req.headers, body);
       } catch (err) {
         out = err instanceof SyntaxError
@@ -83,23 +84,29 @@ export interface CallResult {
 
 const SENSITIVE = /("(number|cvc|cryptogram|googlePayToken|token|storedPaymentMethodId|recurringDetailReference|exp_month|exp_year|name)":\s*")((?:[^"\\]|\\.)*)(")/g;
 
+const SHARED_PAYMENT_TOKEN = /\bspt_[A-Za-z0-9]+/g;
+
 export function redact(text: string): string {
-  return text.replace(SENSITIVE, (_, open: string, key: string, value: string, close: string) =>
-    key === "number" ? `${open}${"*".repeat(Math.max(0, value.length - 4))}${value.slice(-4)}${close}` : `${open}***${close}`);
+  return text
+    .replace(SENSITIVE, (_, open: string, key: string, value: string, close: string) =>
+      key === "number" ? `${open}${"*".repeat(Math.max(0, value.length - 4))}${value.slice(-4)}${close}` : `${open}***${close}`)
+    .replace(SHARED_PAYMENT_TOKEN, "spt_***");
 }
 
 export async function callJson(
   method: string,
   url: string,
-  options: { headers?: Record<string, string>; body?: Json; label?: string; signal?: AbortSignal } = {},
+  options: { headers?: Record<string, string>; body?: Json; form?: Record<string, string>; label?: string; signal?: AbortSignal } = {},
 ): Promise<CallResult> {
-  const payload = options.body === undefined ? undefined : JSON.stringify(options.body);
+  const json = options.body === undefined ? undefined : JSON.stringify(options.body);
+  const payload = options.form ? new URLSearchParams(options.form).toString() : json;
   if (tracing()) {
-    console.log(`  \x1b[2m${options.label ?? "http"} →${method} ${url}${payload ? `\n    ${redact(payload)}` : ""}\x1b[0m`);
+    const shown = options.form ? JSON.stringify(options.form) : json;
+    console.log(`  \x1b[2m${options.label ?? "http"} →${method} ${url}${shown ? `\n    ${redact(shown)}` : ""}\x1b[0m`);
   }
   const response = await fetch(url, {
     method,
-    headers: { "content-type": "application/json", ...options.headers },
+    headers: { "content-type": options.form ? "application/x-www-form-urlencoded" : "application/json", ...options.headers },
     body: payload,
     signal: options.signal,
   });
@@ -110,6 +117,22 @@ export async function callJson(
     console.log(`  \x1b[2m${options.label ?? "http"} ←${response.status} ${shown.length > 600 ? `${shown.slice(0, 600)}…` : shown}\x1b[0m`);
   }
   return { status: response.status, body };
+}
+
+export class IdempotencyCache {
+  private readonly seen = new Map<string, { hash: string; res: Res }>();
+
+  async run(req: Req, next: () => Res | Promise<Res>, conflict: () => Res, keep: (res: Res) => boolean): Promise<Res> {
+    const key = req.headers["idempotency-key"];
+    if (req.method === "GET" || typeof key !== "string") return next();
+    const scope = `${req.method} ${req.path} ${key}`;
+    const hash = createHash("sha256").update(JSON.stringify(req.body ?? {})).digest("hex");
+    const seen = this.seen.get(scope);
+    if (seen) return seen.hash === hash ? seen.res : conflict();
+    const res = await next();
+    if (keep(res)) this.seen.set(scope, { hash, res });
+    return res;
+  }
 }
 
 export function randomId(prefix: string, bytes = 8): string {

@@ -1,20 +1,8 @@
 import { config } from "../config.ts";
 import { callJson } from "../http.ts";
-import type { CallResult, Json } from "../http.ts";
-
-export interface PaymentResult {
-  pspReference?: string;
-  resultCode: string;
-  refusalReason?: string;
-  action?: Json;
-}
-
-export const UNKNOWN_OUTCOME = "Unknown";
-const NOT_CONNECTED = new Set(["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN"]);
-
-export function isOutcomeUnknown(resultCode: string): boolean {
-  return resultCode === UNKNOWN_OUTCOME || resultCode === "Pending" || resultCode === "Received";
-}
+import type { CallResult } from "../http.ts";
+import { UNKNOWN_OUTCOME, transportFailure } from "./payment-outcome.ts";
+import type { PaymentResult } from "./payment-outcome.ts";
 
 export async function makePayment(body: Record<string, unknown>, idempotencyKey: string): Promise<PaymentResult> {
   let res: CallResult;
@@ -26,9 +14,7 @@ export async function makePayment(body: Record<string, unknown>, idempotencyKey:
       signal: AbortSignal.timeout(config.checkoutTimeoutMs),
     });
   } catch (err) {
-    const code = (err as { cause?: { code?: string } }).cause?.code;
-    if (code && NOT_CONNECTED.has(code)) return { resultCode: "Error", refusalReason: `Adyen unreachable (${code})` };
-    return { resultCode: UNKNOWN_OUTCOME, refusalReason: err instanceof Error ? err.message : String(err) };
+    return transportFailure(err, "Adyen");
   }
   if (res.status >= 500 || (res.status === 422 && res.body?.errorCode === "704")) {
     return { resultCode: UNKNOWN_OUTCOME, refusalReason: res.body?.message ?? `HTTP ${res.status}` };

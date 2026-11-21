@@ -1,19 +1,20 @@
 import { config } from "../config.ts";
 import type { Json, Req, Res, Router } from "../http.ts";
-import { sessionTotal } from "../acp.ts";
+import { errorMessage as error, sessionTotal } from "../acp.ts";
 import type { CheckoutSession, LineItem, Message, Quote, Total } from "../acp.ts";
 import type { Item } from "../domain.ts";
-import { isOutcomeUnknown, makePayment } from "./adyen-checkout.ts";
-import type { PaymentResult } from "./adyen-checkout.ts";
+import { makePayment } from "./adyen-checkout.ts";
+import { isOutcomeUnknown } from "./payment-outcome.ts";
+import type { PaymentResult } from "./payment-outcome.ts";
 import { RISK_LIMIT } from "./store.ts";
 import type { Consent, MerchantStore, Pricing } from "./store.ts";
 
-interface Approval {
+export interface Approval<Body = Record<string, unknown>> {
   total: number;
   currency: string;
   items: Item[];
   consent: Consent;
-  pending?: { orderId: string; body: Record<string, unknown> };
+  pending?: { orderId: string; body: Body };
   inFlight?: boolean;
 }
 
@@ -72,19 +73,7 @@ function toQuote(p: Pricing, items: Item[]): Quote {
   };
 }
 
-function commit(store: MerchantStore, approvals: Map<string, Approval>, req: Req): Res {
-  const session: CheckoutSession | undefined = req.body?.session;
-  if (!session || session.id !== req.params.id || !Array.isArray(session.line_items)) {
-    return { status: 400, body: { type: "invalid_request", code: "invalid_session", message: "body.session must be the session in the path" } };
-  }
-  const previous = approvals.get(session.id);
-  if (previous?.pending) {
-    return { status: 200, body: { approved: false, messages: [error("payment_pending", "A payment for this session is pending; finalize it again")] } };
-  }
-  if (previous) {
-    store.release(previous.items);
-    approvals.delete(session.id);
-  }
+export function approve(store: MerchantStore, session: CheckoutSession, paymentLabel: string): { approval: Omit<Approval, "pending" | "inFlight"> } | { messages: Message[] } {
   const fresh = quote(store, {
     currency: session.currency,
     items: session.line_items.map((li) => li.item),
@@ -92,16 +81,12 @@ function commit(store: MerchantStore, approvals: Map<string, Approval>, req: Req
     fulfillment_option_id: session.fulfillment_option_id,
   });
   const errors = fresh.messages.filter((m) => m.type === "error");
-  if (errors.length) return { status: 200, body: { approved: false, messages: errors } };
-  if (sessionTotal(fresh) !== sessionTotal(session)) {
-    return { status: 200, body: { approved: false, messages: [error("product_price_mismatch", "Prices changed, update the session")] } };
-  }
-  if (sessionTotal(session) > RISK_LIMIT) {
-    return { status: 200, body: { approved: false, messages: [error("risk_rejected", "Order exceeds the merchant risk limit")] } };
-  }
+  if (errors.length) return { messages: errors };
+  if (sessionTotal(fresh) !== sessionTotal(session)) return { messages: [error("product_price_mismatch", "Prices changed, update the session")] };
+  if (sessionTotal(session) > RISK_LIMIT) return { messages: [error("risk_rejected", "Order exceeds the merchant risk limit")] };
   const items = fresh.line_items.map((li) => ({ id: li.item.id, quantity: li.item.quantity }));
   const shortage = store.reserve(items);
-  if (shortage) return { status: 200, body: { approved: false, messages: [error("product_out_of_stock", shortage)] } };
+  if (shortage) return { messages: [error("product_out_of_stock", shortage)] };
   const amountOf = (type: Total["type"]) => fresh.totals.find((t) => t.type === type)?.amount ?? 0;
   const consent: Consent = {
     protocol: "acp",
@@ -115,9 +100,28 @@ function commit(store: MerchantStore, approvals: Map<string, Approval>, req: Req
     total: sessionTotal(fresh),
     ...(session.fulfillment_address ? { shippingAddress: session.fulfillment_address } : {}),
     buyerEmail: session.buyer?.email,
-    paymentLabel: config.merchantFlow === "advanced" ? "card, ACP delegated token (merchant authorises)" : "card, ACP delegated token (Adyen authorises)",
+    paymentLabel,
   };
-  approvals.set(session.id, { total: sessionTotal(fresh), currency: session.currency, items, consent });
+  return { approval: { total: sessionTotal(fresh), currency: session.currency, items, consent } };
+}
+
+function commit(store: MerchantStore, approvals: Map<string, Approval>, req: Req): Res {
+  const session: CheckoutSession | undefined = req.body?.session;
+  if (!session || session.id !== req.params.id || !Array.isArray(session.line_items)) {
+    return { status: 400, body: { type: "invalid_request", code: "invalid_session", message: "body.session must be the session in the path" } };
+  }
+  const previous = approvals.get(session.id);
+  if (previous?.pending) {
+    return { status: 200, body: { approved: false, messages: [error("payment_pending", "A payment for this session is pending; finalize it again")] } };
+  }
+  if (previous) {
+    store.release(previous.items);
+    approvals.delete(session.id);
+  }
+  const label = config.merchantFlow === "advanced" ? "card, ACP delegated token (merchant authorises)" : "card, ACP delegated token (Adyen authorises)";
+  const result = approve(store, session, label);
+  if ("messages" in result) return { status: 200, body: { approved: false, messages: result.messages } };
+  approvals.set(session.id, result.approval);
   return { status: 200, body: { approved: true } };
 }
 
@@ -179,6 +183,7 @@ async function finalize(store: MerchantStore, approvals: Map<string, Approval>, 
   const order = store.recordOrder({
     id: orderId,
     protocol: "acp",
+    provider: "adyen",
     checkoutSessionId: sessionId,
     pspReference,
     amount: approval.total,
@@ -190,8 +195,4 @@ async function finalize(store: MerchantStore, approvals: Map<string, Approval>, 
     status: 200,
     body: { result_code: resultCode, psp_reference: pspReference, order: { id: order.id, permalink_url: `${config.merchantUrl}/orders/${order.id}` } },
   };
-}
-
-function error(code: string, content: string): Message {
-  return { type: "error", code, content, content_type: "plain" };
 }
