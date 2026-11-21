@@ -5,6 +5,9 @@ import { Router, callJson, pspReference, randomId } from "../http.ts";
 import type { Json, Req, Res } from "../http.ts";
 import { sessionTotal } from "../acp.ts";
 import type { CheckoutSession, Message, Quote } from "../acp.ts";
+import { signNotification } from "../adyen-hmac.ts";
+import type { NotificationRequestItem } from "../adyen-hmac.ts";
+import { decodeMockGooglePayToken } from "../google-pay-mock.ts";
 
 interface Allowance {
   reason: "one_time";
@@ -25,13 +28,16 @@ interface TokenRecord {
 
 interface Payment {
   pspReference: string;
-  resultCode: "Authorised" | "Refused";
+  resultCode: "Authorised" | "Refused" | "RedirectShopper";
   refusalReason?: string;
   merchantReference: string;
   amount: { value: number; currency: string };
+  paymentMethodType?: string;
+  action?: Json;
 }
 
 const REFUSED_CARD_SUFFIX = "0002";
+const CHALLENGE_CARD_SUFFIX = "0044";
 
 export class MockAdyen {
   readonly sessions = new Map<string, CheckoutSession>();
@@ -302,7 +308,68 @@ export class MockAdyen {
     if (req.headers["x-api-key"] !== config.checkoutApiKey) {
       return { status: 401, body: { status: 401, errorCode: "000", message: "HTTP Status Response - Unauthorized", errorType: "security" } };
     }
-    return this.authorise(req.body ?? {});
+    const key = req.headers["idempotency-key"];
+    const scope = typeof key === "string" ? `payments ${key}` : undefined;
+    const hash = createHash("sha256").update(JSON.stringify(req.body ?? {})).digest("hex");
+    const seen = scope ? this.idempotency.get(scope) : undefined;
+    if (seen) {
+      return seen.hash === hash
+        ? seen.res
+        : { status: 422, body: { status: 422, errorCode: "704", message: "request already processed or in progress", errorType: "validation" } };
+    }
+    const body = req.body ?? {};
+    const res = body.paymentMethod?.type === "googlepay" ? this.authoriseGooglePay(body) : this.authorise(body);
+    if (scope) this.idempotency.set(scope, { hash, res });
+    this.notify(body, res.body);
+    return res;
+  }
+
+  private authoriseGooglePay(body: Json): { status: number; body: Payment & Json } {
+    const reference = body.reference ?? "";
+    const amount = body.amount ?? {};
+    const payload = decodeMockGooglePayToken(body.paymentMethod.googlePayToken ?? "");
+    if (!payload) {
+      return { status: 422, body: { status: 422, errorCode: "14_018", message: "Invalid googlePayToken", errorType: "validation" } as Json };
+    }
+    const record = (resultCode: Payment["resultCode"], extra: Partial<Payment> = {}) => {
+      const payment: Payment = { pspReference: pspReference(), resultCode, merchantReference: reference, amount, paymentMethodType: "googlepay", ...extra };
+      this.payments.push(payment);
+      return { status: 200, body: payment };
+    };
+    if (payload.gateway !== "adyen" || payload.gatewayMerchantId !== body.merchantAccount) {
+      return record("Refused", { refusalReason: "Token was encrypted for another gateway merchant" });
+    }
+    if (Date.parse(payload.messageExpiration) <= Date.now()) return record("Refused", { refusalReason: "Google Pay token expired" });
+    if (payload.amount !== amount.value || payload.currency !== amount.currency) {
+      return record("Refused", { refusalReason: "Amount differs from the amount shown in the Google Pay sheet" });
+    }
+    if (payload.last4 === REFUSED_CARD_SUFFIX) return record("Refused", { refusalReason: "Not enough balance" });
+    if (payload.last4 === CHALLENGE_CARD_SUFFIX && payload.authMethod === "PAN_ONLY") {
+      return record("RedirectShopper", { action: { type: "redirect", paymentMethodType: "googlepay", url: "https://checkoutshopper-test.adyen.com/mock-3ds", method: "GET" } });
+    }
+    return record("Authorised");
+  }
+
+  private notify(request: Json, payment: Json): void {
+    if (!payment?.pspReference || payment.resultCode === "RedirectShopper") return;
+    const item: NotificationRequestItem = {
+      amount: payment.amount,
+      eventCode: "AUTHORISATION",
+      eventDate: new Date().toISOString(),
+      merchantAccountCode: request.merchantAccount,
+      merchantReference: payment.merchantReference,
+      pspReference: payment.pspReference,
+      reason: payment.refusalReason ?? "",
+      success: payment.resultCode === "Authorised" ? "true" : "false",
+      additionalData: { paymentMethod: payment.paymentMethodType ?? "visa" },
+    };
+    if (config.webhookHmacKey) item.additionalData!.hmacSignature = signNotification(item, config.webhookHmacKey);
+    setTimeout(() => {
+      callJson("POST", `${config.merchantUrl}/adyen/webhooks`, {
+        label: "adyen→merchant webhook",
+        body: { live: "false", notificationItems: [{ NotificationRequestItem: item }] },
+      }).catch(() => undefined);
+    }, 20);
   }
 
   private authorise(body: Json): { status: number; body: Payment & Json } {

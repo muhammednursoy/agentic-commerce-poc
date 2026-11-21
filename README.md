@@ -1,29 +1,49 @@
-# Adyen ACP agentic commerce POC
+# Agentic payments with Adyen: Gemini + Google UCP, and ACP
 
-A runnable proof of concept of [Adyen's Agentic Commerce Protocol (ACP) integration](https://docs.adyen.com/online-payments/agentic-commerce/agent-platform/ai-agent-integration-acp): an LLM shopping agent buys from a merchant on the shopper's behalf, Adyen runs the ACP checkout session and tokenizes the card into a single-use, merchant-scoped token, and the merchant charges that token with `POST /payments`.
+A runnable proof of concept that answers one question: **can an AI agent pay a merchant whose backend runs on Adyen?** The agent is Gemini (or Claude, or a scripted stand-in); the merchant is a small backend; Adyen authorises the payment.
 
-Adyen's ACP endpoints are gated (Delegated Payment access, a dedicated agentic token and merchant enablement come from your Adyen account manager), so the POC ships a **local mock of Adyen** that follows the documented contract. Point the env vars at the real test hosts once you have access.
+Two agentic protocols are implemented side by side:
 
-## Actors and flow
+| | **Google UCP** (default) | **ACP** |
+|---|---|---|
+| Who runs the checkout session | the merchant's backend | Adyen Commerce Suite |
+| Payment credential | encrypted Google Pay token (`PAYMENT_GATEWAY`, gateway `adyen`) | Adyen single-use ACP token from `delegate_payment` |
+| Merchant's Adyen call | `POST /payments` with `paymentMethod.type: googlepay` | `POST /payments` with `storedPaymentMethodId` |
+| Adyen docs | [Google agentic commerce](https://docs.adyen.com/online-payments/agentic-commerce/merchant/google-agentic-commerce) | [AI agent integration (ACP)](https://docs.adyen.com/online-payments/agentic-commerce/agent-platform/ai-agent-integration-acp) |
+
+Adyen's agentic endpoints and Google's agent surfaces need onboarding, so the repo ships a **local mock of Adyen** that follows the documented contracts. Everything runs offline; env vars switch the merchant to Adyen's real test environment.
+
+## Google UCP flow (Gemini pays with Google Pay)
 
 ```
- Shopper ──chat──▶ AI agent (Gemini / Claude / scripted)
-                     │ tools
-                     ▼
-              Agent platform ──────────────▶ Adyen Commerce Suite (ACP)
-              (holds the card)   checkout_sessions create / update / complete
-                     │                              │  quote, commit, finalize
-                     │ delegate_payment             ▼
-                     └────────▶ Adyen PAL ──token──▶ Merchant ──POST /payments──▶ Adyen Checkout
+ Shopper ──chat──▶ Gemini agent ──UCP REST──▶ Merchant backend ──POST /payments (googlepay)──▶ Adyen
+                     │  ▲                          │   ▲                                         │
+                     │  └── Google Pay sheet ──────┘   └──────── AUTHORISATION webhook (HMAC) ───┘
+                     │      (shopper approves, encrypted token for gateway "adyen")
 ```
 
-1. The agent reads the merchant's product feed and calls `POST /checkout_sessions` with the items. Adyen asks the merchant for stock, shipping options, tax and totals.
-2. The agent selects a shipping option with `POST /checkout_sessions/{id}` until the session is `ready_for_payment`.
-3. The shopper approves the exact total in the terminal. The platform then calls `POST /agentic_commerce/delegate_payment` with the vaulted card and an `allowance` (`one_time`, `max_amount` = session total, bound to the session and the merchant, 15-minute expiry). The LLM never sees card data; the tool takes only a session id.
-4. The agent calls `POST /checkout_sessions/{id}/complete` with `payment_data.token`. Adyen asks the merchant to commit (risk and price re-check) and finalize.
-   - **advanced flow** (default): the merchant calls `POST /payments` with `paymentMethod.storedPaymentMethodId = <token>`, `shopperInteraction: ContAuth`, `recurringProcessingModel: UnscheduledCardOnFile`.
-   - **standard flow** (`MERCHANT_FLOW=standard`): Adyen authorises and the merchant only records the order.
-5. The session becomes `completed` with `order.id` and `order.permalink_url`.
+1. **Discover.** The agent reads `GET /.well-known/ucp`: the `dev.ucp.shopping` REST endpoint, the checkout and fulfillment capabilities, and a `com.google.pay` payment handler whose `tokenization_specification` is `PAYMENT_GATEWAY` with `gateway: adyen` and `gatewayMerchantId` = the Adyen merchant account.
+2. **Checkout.** `POST /checkout-sessions` with line items, buyer email and shipping destination returns `incomplete` with `missing` messages. `PUT /checkout-sessions/{id}` (full replacement) selects a shipping option, and the status becomes `ready_for_complete`.
+3. **Google Pay.** The shopper approves the exact total in the Google Pay sheet. The sheet returns a payment instrument with `credential: { type: "PAYMENT_GATEWAY", token }`, where the token is encrypted for Adyen.
+4. **Complete.** `POST /checkout-sessions/{id}/complete` (with `Idempotency-Key`). The merchant sends the token unchanged to Adyen `POST /payments`:
+   ```json
+   { "merchantAccount": "…", "amount": { "value": 7673, "currency": "USD" }, "reference": "ord_…",
+     "paymentMethod": { "type": "googlepay", "googlePayToken": "<token>" },
+     "returnUrl": "https://merchant/checkout/chk_…",
+     "metadata": { "agentProtocol": "UCP", "agentSessionId": "chk_…", "agentPlatform": "Google" } }
+   ```
+5. **Outcome.**
+   - `Authorised` → `completed` with `order.id` and `order.permalink_url`.
+   - `Refused` → stays `ready_for_complete` with a recoverable `payment_declined` message; the agent asks the shopper and may retry with a new token.
+   - `RedirectShopper` (3-D Secure) → `requires_escalation` with a `continue_url`.
+   - Orders above the risk limit also escalate (`high_value_order`).
+6. **Webhook.** Adyen posts an `AUTHORISATION` notification; the merchant verifies its HMAC signature and attaches it to the order.
+
+The LLM never sees card data. Its payment tool takes only a checkout id, and the platform runs the approval step and the token step.
+
+## ACP flow
+
+The agent creates and updates the checkout session on Adyen's Commerce Suite, which asks the merchant for quotes. It tokenizes the card with `delegate_payment`: the token is single use, bound to the session and the merchant, and capped by `max_amount`. Completing the session makes Adyen call the merchant's commit and finalize hooks. In the advanced flow (the default) the merchant charges the token with `POST /payments`. Run it with `PROTOCOL=acp`.
 
 ## Run
 
@@ -31,72 +51,97 @@ Requires Node 23.6+ (TypeScript runs natively, no build step).
 
 ```bash
 npm install
-npm run demo          # mock Adyen + merchant + agent, auto-approved, full HTTP trace
-npm test              # 19 contract and end-to-end tests
+npm run demo                 # UCP + Google Pay, scripted agent, auto-approved, full HTTP trace
+PROTOCOL=acp npm run demo    # same purchase over ACP
+npm test                     # 40 contract and end-to-end tests
 ```
 
-Chat with a real LLM agent (servers in one terminal, agent in another):
+Chat with a real agent. Start the servers in one terminal:
 
 ```bash
 npm run servers
+```
+
+Then run the agent in another:
+
+```bash
 GEMINI_API_KEY=... npm run agent -- "2 paket kahve çekirdeği ve filtre kağıdı al"
 ```
 
-| Provider | Cost | Key |
+| `LLM_PROVIDER` | Cost | Key |
 |---|---|---|
-| `gemini` (default when a key is set) | Free tier available on Google AI Studio, with rate limits | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
-| `claude` | Paid API usage | `ANTHROPIC_API_KEY` from the Claude Console |
-| `scripted` | Free, no LLM | none; deterministic keyword matcher, used by tests |
+| `gemini` (default when a key is set) | free tier on Google AI Studio, rate limited | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
+| `claude` | paid API usage | `ANTHROPIC_API_KEY` |
+| `scripted` | free, no LLM | none; deterministic keyword matcher used by tests |
 
-`GEMINI_MODEL` / `CLAUDE_MODEL` override the model. If the free tier rejects a model with a quota error, try a Flash-Lite model such as `gemini-3.5-flash-lite`. The Claude client enables server-side refusal fallbacks (`fallbacks: "default"`).
+`GEMINI_MODEL` / `CLAUDE_MODEL` override the model. If the free tier rejects a model with a quota error, try `GEMINI_MODEL=gemini-3.5-flash-lite`.
 
-Things to try in the chat: an out-of-stock item (the gooseneck kettle), express shipping, changing quantities, declining the approval, or `AGENT_TEST_CARD=4000000000000002` for a declined payment.
+Mock test cards (set `AGENT_TEST_CARD`):
 
-## Against the real Adyen test environment
+| Card ending | Result |
+|---|---|
+| `1111` (default) | Authorised |
+| `0002` | Refused, not enough balance |
+| `0044` | 3-D Secure challenge (UCP: `requires_escalation`) |
+
+Other scenarios to try in chat: the out-of-stock gooseneck kettle, express shipping, changing quantities, closing the Google Pay sheet.
+
+## Against Adyen's test environment
+
+UCP path: the merchant talks to the real Checkout API, and you supply a real Google Pay test token.
 
 ```bash
-ADYEN_MODE=test \
-ADYEN_COMPANY_ACCOUNT=... ADYEN_MERCHANT_ACCOUNT=... \
-ADYEN_COMMERCE_SUITE_API_KEY=... ADYEN_AGENTIC_TOKEN=... ADYEN_CHECKOUT_API_KEY=... \
-npm run agent
+ADYEN_MODE=test ADYEN_MERCHANT_ACCOUNT=... ADYEN_CHECKOUT_API_KEY=... ADYEN_HMAC_KEY=... \
+GOOGLE_PAY_TOKEN=@token.json npm run servers
 ```
+
+Generate `token.json` with Google's Google Pay Code Generator, using gateway `adyen` and your merchant account as `gatewayMerchantId`. The token must be created for the same amount and currency as the checkout total. This proves the merchant → Adyen leg for real. Having real Gemini or AI Mode call your UCP endpoints requires Google's merchant onboarding and a public HTTPS endpoint, which a local POC cannot simulate.
+
+ACP path: also set `ADYEN_COMPANY_ACCOUNT`, `ADYEN_COMMERCE_SUITE_API_KEY` and `ADYEN_AGENTIC_TOKEN`. Adyen must enable Delegated Payment and the agentic token for your account.
 
 | Call | Test host | Auth |
 |---|---|---|
-| ACP checkout sessions | `https://commerce-suite-test.adyen.com/commerce-suite/acp/v1/{companyAccount}` | `Authorization: Bearer` key with the Commerce Suite API role |
-| delegate_payment | `https://pal-test.adyen.com/paltokenization/servlet/Recurring/Agentic/acp/v1` | `Authorization: Bearer` dedicated agentic token, `API-Version: 2025-09-29` |
-| /payments | `https://checkout-test.adyen.com/v72` | `X-API-Key` |
+| Checkout `/payments` | `https://checkout-test.adyen.com/v72` | `X-API-Key` |
+| ACP checkout sessions | `https://commerce-suite-test.adyen.com/commerce-suite/acp/v1/{companyAccount}` | `Authorization: Bearer` (Commerce Suite API role) |
+| ACP `delegate_payment` | `https://pal-test.adyen.com/paltokenization/servlet/Recurring/Agentic/acp/v1` | `Authorization: Bearer` agentic token, `API-Version: 2025-09-29` |
 
-Prerequisites from Adyen's docs: Delegated Payment access, the agentic token, merchant accounts enabled for Agentic Commerce, PCI DSS Level 1 and Adyen's security review for the agent platform. Adyen must also be able to reach the merchant server, so expose it publicly and register it with Adyen.
+## Documented vs assumed
 
-## What is documented and what is assumed
+Taken from the docs:
 
-Taken from Adyen's docs: endpoint paths and hosts, headers, request fields for sessions, complete and delegate_payment, token scoping rules (single use, bound to session and merchant, capped by `max_amount`, expiry), error codes (`invalid_card` with `param`, `idempotency_conflict`), session statuses and `messages[]`, and the `/payments` fields for the ACP token.
+- UCP 2026-01-23: discovery profile, checkout endpoints and statuses, PUT full replacement, message severities, `PAYMENT_GATEWAY` credential at `payment.instruments[].credential.token`.
+- Adyen Google flow: `googlepay` + `googlePayToken`, `metadata.agentProtocol/agentSessionId/agentPlatform`, gateway `adyen`.
+- ACP: endpoints, headers, `delegate_payment` fields, token scoping, error codes.
 
-Assumed by this POC, to confirm with Adyen:
+Assumed, to confirm before production:
 
-- The merchant hooks Adyen calls. The docs' sequence diagram names `/agentic/sessions/{id}/commit` and `/finalize`; the quote hook (`POST /agentic/quote`) and all hook bodies are this POC's own design.
-- `paymentMethod.type: "scheme"` in `/payments`; the ACP pages do not state it.
-- `shopperReference` set to the checkout session id, as the merchant page says.
-- delegate_payment returns 201 with `id` (the two Adyen pages disagree on 200 vs 201 and on the response fields).
-- No `Signature` header; Adyen recommends HMAC-SHA256 but does not document the signing string or key.
-- Webhooks are not modelled.
+- UCP field details that only appeared in summarised spec text: the postal address field names, `UCP-Agent` as the only required header, and the shape of the `ucp` envelope in responses.
+- `Request-Signature` verification and `signing_keys` are not implemented.
+- The mock decrypts nothing. Its Google Pay token wraps a base64 JSON payload, and the mock enforces the gateway merchant, amount and expiry that a real token binds cryptographically.
+- ACP: the merchant hook paths and bodies (`/agentic/quote`, commit, finalize), `paymentMethod.type: "scheme"`, and the 201 response of `delegate_payment` (Adyen's pages disagree).
+- 3-D Secure completion after `requires_escalation` is not implemented; `continue_url` returns the escalation details only.
 
 ## Layout
 
 ```
 src/
-  acp.ts                 ACP types (session, line items, totals, messages)
-  config.ts              env-driven hosts and keys, mock vs test
-  http.ts                tiny JSON router and traced fetch, card redaction
-  mock-adyen/server.ts   fake Commerce Suite, PAL delegate_payment, Checkout /payments
-  merchant/server.ts     catalog, quote/commit/finalize hooks, /payments call, orders
-  agent/platform.ts      agent platform: Adyen ACP client and card vault
-  agent/tools.ts         tools exposed to the LLM, shopper approval gate
-  agent/llm/*.ts         Gemini, Claude and scripted agents
-  agent/cli.ts           interactive chat
-  demo.ts, servers.ts
-test/flow.test.ts
+  ucp.ts, acp.ts              protocol types
+  config.ts, http.ts          env, JSON router, traced fetch with card redaction
+  adyen-hmac.ts               webhook HMAC sign/verify
+  google-pay-mock.ts          mock Google Pay token format
+  mock-adyen/server.ts        fake Checkout /payments (googlepay + ACP token), ACP Commerce Suite, PAL, webhooks
+  merchant/
+    store.ts                  catalog, pricing, tax, shipping, orders
+    ucp-server.ts             /.well-known/ucp and UCP checkout sessions
+    acp-hooks.ts              quote/commit/finalize hooks Adyen calls for ACP
+    adyen-checkout.ts         /payments client
+    server.ts                 routes, webhook receiver
+  agent/
+    ucp/                      UCP client, Google Pay sheet, Gemini tools
+    acp/                      ACP client (Commerce Suite + delegate_payment), tools
+    llm/                      Gemini, Claude, scripted agents
+    cli.ts, factory.ts, shopper.ts, toolset.ts
+test/ucp.test.ts, test/acp.test.ts
 ```
 
-Test card numbers in the mock: anything ending in `0002` is refused, everything else is authorised. All data is fake; do not put real card numbers in this repo.
+All data is fake. Do not put real card numbers or real Google Pay tokens in this repo.

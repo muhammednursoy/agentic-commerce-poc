@@ -12,8 +12,9 @@ const { config } = await import("../src/config.ts");
 const { callJson } = await import("../src/http.ts");
 const { MockAdyen } = await import("../src/mock-adyen/server.ts");
 const { Merchant } = await import("../src/merchant/server.ts");
-const { AgentPlatform, AdyenApiError, defaultShopper } = await import("../src/agent/platform.ts");
-const { AgentTools, systemPrompt } = await import("../src/agent/tools.ts");
+const { AgentPlatform, AdyenApiError } = await import("../src/agent/acp/platform.ts");
+const { defaultShopper } = await import("../src/agent/shopper.ts");
+const { AcpToolset } = await import("../src/agent/acp/tools.ts");
 const { ScriptedAgent, pickItems } = await import("../src/agent/llm/scripted.ts");
 const { sessionTotal } = await import("../src/acp.ts");
 
@@ -201,12 +202,12 @@ describe("agent end to end", () => {
   test("scripted agent completes an order and the merchant records it", async () => {
     const platform = new AgentPlatform();
     const approvals: string[] = [];
-    const tools = new AgentTools(platform, async (summary) => {
+    const toolset = new AcpToolset(platform, async (summary: string) => {
       approvals.push(summary);
       return true;
     });
     const stockBefore = merchant.catalog.get("sku_coffee_beans")!.stock;
-    const reply = await new ScriptedAgent({ tools, system: systemPrompt(platform) }).send("Buy 2 bags of the coffee beans and a pack of paper filters");
+    const reply = await new ScriptedAgent({ toolset }).send("Buy 2 bags of the coffee beans and a pack of paper filters");
 
     assert.match(reply, /^Order ord_/);
     assert.equal(approvals.length, 1);
@@ -223,8 +224,8 @@ describe("agent end to end", () => {
     const platform = new AgentPlatform();
     const tokensBefore = adyen.tokens.size;
     const ordersBefore = merchant.orders.size;
-    const tools = new AgentTools(platform, async () => false);
-    const reply = await new ScriptedAgent({ tools, system: "" }).send("one pour-over dripper");
+    const toolset = new AcpToolset(platform, async () => false);
+    const reply = await new ScriptedAgent({ toolset }).send("one pour-over dripper");
     assert.match(reply, /did not place/);
     assert.equal(adyen.tokens.size, tokensBefore);
     assert.equal(merchant.orders.size, ordersBefore);

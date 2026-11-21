@@ -1,4 +1,4 @@
-import type { AgentTools } from "../tools.ts";
+import type { Toolset } from "../toolset.ts";
 
 export interface ChatAgent {
   readonly label: string;
@@ -6,8 +6,7 @@ export interface ChatAgent {
 }
 
 export interface AgentOptions {
-  tools: AgentTools;
-  system: string;
+  toolset: Toolset;
   onToolCall?: (name: string, input: unknown) => void;
   maxSteps?: number;
 }

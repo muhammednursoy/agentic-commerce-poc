@@ -1,5 +1,4 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { TOOL_DEFINITIONS } from "../tools.ts";
 import type { AgentOptions, ChatAgent } from "./types.ts";
 
 export const DEFAULT_CLAUDE_MODEL = "claude-opus-5-5";
@@ -21,8 +20,9 @@ export class ClaudeAgent implements ChatAgent {
   }
 
   async send(userText: string): Promise<string> {
+    const { toolset } = this.options;
     this.messages.push({ role: "user", content: userText });
-    const tools: Anthropic.Beta.Messages.BetaTool[] = TOOL_DEFINITIONS.map((t) => ({
+    const tools: Anthropic.Beta.Messages.BetaTool[] = toolset.definitions.map((t) => ({
       name: t.name,
       description: t.description,
       input_schema: t.parameters as Anthropic.Beta.Messages.BetaTool.InputSchema,
@@ -32,7 +32,7 @@ export class ClaudeAgent implements ChatAgent {
       const response = await this.client.beta.messages.create({
         model: this.model,
         max_tokens: 16000,
-        system: this.options.system,
+        system: toolset.system,
         tools,
         messages: this.messages,
         output_config: { effort: "medium" },
@@ -50,7 +50,7 @@ export class ClaudeAgent implements ChatAgent {
       for (const block of response.content) {
         if (block.type !== "tool_use") continue;
         this.options.onToolCall?.(block.name, block.input);
-        const output = await this.options.tools.execute(block.name, block.input as Record<string, unknown>);
+        const output = await toolset.execute(block.name, block.input as Record<string, unknown>);
         results.push({ type: "tool_result", tool_use_id: block.id, content: JSON.stringify(output) });
       }
       this.messages.push({ role: "user", content: results });

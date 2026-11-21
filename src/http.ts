@@ -54,8 +54,9 @@ export class Router {
           ? { status: 400, body: { type: "invalid_request", code: "invalid_json", message: err.message } }
           : { status: 500, body: { type: "processing_error", message: String(err) } };
       }
-      res.writeHead(out.status, { "content-type": "application/json" });
-      res.end(out.body === undefined ? "" : JSON.stringify(out.body));
+      const text = typeof out.body === "string";
+      res.writeHead(out.status, { "content-type": text ? "text/plain" : "application/json" });
+      res.end(out.body === undefined ? "" : text ? out.body : JSON.stringify(out.body));
     });
     return new Promise((resolve) => server.listen(port, () => {
       if (tracing()) console.log(`[${name}] listening on http://localhost:${port}`);
@@ -102,7 +103,7 @@ export async function callJson(
     body: payload,
   });
   const text = await response.text();
-  const body = text ? JSON.parse(text) : undefined;
+  const body = response.headers.get("content-type")?.includes("json") && text ? JSON.parse(text) : text || undefined;
   if (tracing()) {
     console.log(`  \x1b[2m${options.label ?? "http"} ←${response.status} ${text.length > 600 ? `${text.slice(0, 600)}…` : text}\x1b[0m`);
   }

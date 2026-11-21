@@ -1,6 +1,5 @@
 import { GoogleGenAI } from "@google/genai";
 import type { Content, Part } from "@google/genai";
-import { TOOL_DEFINITIONS } from "../tools.ts";
 import type { AgentOptions, ChatAgent } from "./types.ts";
 
 export const DEFAULT_GEMINI_MODEL = "gemini-3.8-flash";
@@ -20,6 +19,7 @@ export class GeminiAgent implements ChatAgent {
   }
 
   async send(userText: string): Promise<string> {
+    const { toolset } = this.options;
     this.history.push({ role: "user", parts: [{ text: userText }] });
     const maxSteps = this.options.maxSteps ?? 15;
     for (let step = 0; step < maxSteps; step++) {
@@ -27,9 +27,9 @@ export class GeminiAgent implements ChatAgent {
         model: this.model,
         contents: this.history,
         config: {
-          systemInstruction: this.options.system,
+          systemInstruction: toolset.system,
           tools: [{
-            functionDeclarations: TOOL_DEFINITIONS.map((t) => ({
+            functionDeclarations: toolset.definitions.map((t) => ({
               name: t.name,
               description: t.description,
               parametersJsonSchema: t.parameters,
@@ -46,7 +46,7 @@ export class GeminiAgent implements ChatAgent {
       for (const call of calls) {
         const name = call.name ?? "";
         this.options.onToolCall?.(name, call.args);
-        const output = await this.options.tools.execute(name, call.args ?? {});
+        const output = await toolset.execute(name, call.args ?? {});
         parts.push({ functionResponse: { id: call.id, name, response: { output } } });
       }
       this.history.push({ role: "user", parts });
