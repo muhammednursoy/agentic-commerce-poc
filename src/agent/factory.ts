@@ -23,7 +23,7 @@ export function createToolset(confirm: Confirm, protocol: "acp" | "ucp" | "strip
 
 export function createAgent(options: AgentOptions, provider = process.env.LLM_PROVIDER): ChatAgent {
   const geminiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
-  const chosen = provider || (geminiKey ? "gemini" : process.env.ANTHROPIC_API_KEY ? "claude" : "scripted");
+  const chosen = provider || (process.env.ANTHROPIC_API_KEY ? "claude" : geminiKey ? "gemini" : "scripted");
   switch (chosen) {
     case "gemini":
       if (!geminiKey) throw new Error("LLM_PROVIDER=gemini needs GEMINI_API_KEY (free key: https://aistudio.google.com/apikey)");

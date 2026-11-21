@@ -2,7 +2,9 @@ import Anthropic from "@anthropic-ai/sdk";
 import { isToolError } from "../toolset.ts";
 import type { AgentOptions, ChatAgent } from "./types.ts";
 
-export const DEFAULT_CLAUDE_MODEL = "claude-opus-5-5";
+export const DEFAULT_CLAUDE_MODEL = "claude-haiku-5-5";
+const SERVER_FALLBACK_MODELS = new Set(["claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5", "claude-fable-5-1", "claude-fable-5-2"]);
+type Effort = "low" | "medium" | "high" | "xhigh" | "max";
 
 type MessageParam = Anthropic.Beta.Messages.BetaMessageParam;
 type ToolResult = Anthropic.Beta.Messages.BetaToolResultBlockParam;
@@ -13,11 +15,13 @@ export class ClaudeAgent implements ChatAgent {
   private readonly model: string;
   private readonly options: AgentOptions;
   private readonly messages: MessageParam[] = [];
+  private readonly effort: Effort;
 
   constructor(options: AgentOptions, model = process.env.CLAUDE_MODEL || DEFAULT_CLAUDE_MODEL) {
     this.model = model;
     this.options = options;
-    this.label = `claude (${model})`;
+    this.effort = (process.env.AGENT_CLAUDE_EFFORT as Effort) || (model.startsWith("claude-haiku") ? "low" : "medium");
+    this.label = `claude (${model}, effort ${this.effort})`;
   }
 
   async send(userText: string): Promise<string> {
@@ -36,9 +40,8 @@ export class ClaudeAgent implements ChatAgent {
         system: toolset.system,
         tools,
         messages: this.messages,
-        output_config: { effort: "medium" },
-        betas: ["server-side-fallback-2026-07-01"],
-        fallbacks: "default",
+        output_config: { effort: this.effort },
+        ...(SERVER_FALLBACK_MODELS.has(this.model) ? { betas: ["server-side-fallback-2026-07-01"], fallbacks: "default" as const } : {}),
       });
       if (response.stop_reason === "refusal") return "(the model declined this request)";
       this.messages.push({ role: "assistant", content: response.content });

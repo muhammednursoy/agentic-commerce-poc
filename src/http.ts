@@ -82,7 +82,7 @@ export interface CallResult {
   body: Json;
 }
 
-const SENSITIVE = /("(number|cvc|cryptogram|googlePayToken|token|storedPaymentMethodId|recurringDetailReference|exp_month|exp_year|name)":\s*")((?:[^"\\]|\\.)*)(")/g;
+const SENSITIVE = /("(number|cvc|cryptogram|googlePayToken|token|storedPaymentMethodId|recurringDetailReference|exp_month|exp_year|name|client_secret)":\s*")((?:[^"\\]|\\.)*)(")/g;
 
 const SHARED_PAYMENT_TOKEN = /\bspt_[A-Za-z0-9]+/g;
 
