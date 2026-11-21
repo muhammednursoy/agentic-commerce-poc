@@ -2,7 +2,8 @@ import { GoogleGenAI } from "@google/genai";
 import type { Content, Part } from "@google/genai";
 import type { AgentOptions, ChatAgent } from "./types.ts";
 
-export const DEFAULT_GEMINI_MODEL = "gemini-3.8-flash";
+export const DEFAULT_GEMINI_MODEL = "gemini-3.6-flash";
+const REQUEST_TIMEOUT_MS = 60_000;
 
 export class GeminiAgent implements ChatAgent {
   readonly label: string;
@@ -12,7 +13,10 @@ export class GeminiAgent implements ChatAgent {
   private readonly history: Content[] = [];
 
   constructor(options: AgentOptions, apiKey: string, model = process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL) {
-    this.ai = new GoogleGenAI({ apiKey });
+    this.ai = new GoogleGenAI({
+      apiKey,
+      httpOptions: { timeout: REQUEST_TIMEOUT_MS, retryOptions: { attempts: 3, initialDelay: 2, maxDelay: 8 } },
+    });
     this.model = model;
     this.options = options;
     this.label = `gemini (${model})`;
