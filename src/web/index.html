@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Brew & Co · AI alışveriş</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #ffffff; --ink: #1d1b18; --muted: #6f6a62; --line: #e6e2da;
+    --accent: #7a4b2a; --accent-ink: #ffffff; --user: #7a4b2a; --user-ink: #fff;
+    --agent: #ffffff; --chip: #efebe4; --ok: #1f7a4d; --warn: #9a5b00; --err: #b3261e;
+    --shadow: 0 1px 2px rgba(0,0,0,.05), 0 8px 24px rgba(0,0,0,.06);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #151412; --panel: #1f1d1a; --ink: #f1ede6; --muted: #a39d93; --line: #34302b;
+      --accent: #d29a6a; --accent-ink: #1a1410; --user: #8a5a36; --user-ink: #fff;
+      --agent: #24221f; --chip: #2c2925; --ok: #5cc28f; --warn: #e0a04a; --err: #ef7a72;
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.35);
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif; }
+  header { display: flex; align-items: center; gap: 12px; padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 2; }
+  header h1 { font-size: 17px; margin: 0; letter-spacing: -.01em; }
+  header .logo { width: 30px; height: 30px; border-radius: 8px; background: var(--accent); color: var(--accent-ink); display: grid; place-items: center; font-weight: 700; }
+  .badges { margin-left: auto; display: flex; gap: 6px; flex-wrap: wrap; }
+  .badge { font-size: 12px; padding: 3px 9px; border-radius: 999px; background: var(--chip); color: var(--muted); }
+  .badge.live { color: var(--ok); }
+  button.link { background: none; border: 0; color: var(--muted); cursor: pointer; font: inherit; font-size: 13px; }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 20px; max-width: 1180px; margin: 0 auto; padding: 20px; height: calc(100vh - 59px); }
+  .chat { display: flex; flex-direction: column; min-height: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 16px; box-shadow: var(--shadow); }
+  #log { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 10px; }
+  .msg { max-width: 78%; padding: 10px 14px; border-radius: 14px; white-space: normal; overflow-wrap: anywhere; }
+  .msg.user { align-self: flex-end; background: var(--user); color: var(--user-ink); border-bottom-right-radius: 4px; }
+  .msg.agent { align-self: flex-start; background: var(--agent); border: 1px solid var(--line); border-bottom-left-radius: 4px; }
+  .msg.agent ul { margin: 6px 0; padding-left: 20px; }
+  .msg code { font-size: 13px; background: var(--chip); padding: 1px 5px; border-radius: 5px; }
+  .tool { align-self: flex-start; font-size: 13px; color: var(--muted); display: flex; gap: 6px; align-items: center; }
+  .tool::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+  .tool.err { color: var(--err); }
+  .tool.err::before { background: var(--err); }
+  .typing { align-self: flex-start; color: var(--muted); font-size: 13px; }
+  .typing span { animation: blink 1.2s infinite; }
+  .typing span:nth-child(2) { animation-delay: .2s; } .typing span:nth-child(3) { animation-delay: .4s; }
+  @keyframes blink { 0%, 80%, 100% { opacity: .2 } 40% { opacity: 1 } }
+  .card { align-self: stretch; border: 1px solid var(--line); border-radius: 14px; padding: 14px; background: var(--bg); }
+  .card h3 { margin: 0 0 8px; font-size: 14px; }
+  .row { display: flex; justify-content: space-between; gap: 12px; font-size: 14px; padding: 2px 0; }
+  .row.total { font-weight: 700; border-top: 1px solid var(--line); margin-top: 6px; padding-top: 8px; }
+  .muted { color: var(--muted); }
+  .ok { color: var(--ok); } .err { color: var(--err); }
+  .card a { color: var(--accent); }
+  form { display: flex; gap: 8px; padding: 12px; border-top: 1px solid var(--line); }
+  textarea { flex: 1; resize: none; border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; font: inherit; background: var(--bg); color: var(--ink); min-height: 44px; max-height: 140px; }
+  textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .primary { background: var(--accent); color: var(--accent-ink); border: 0; border-radius: 12px; padding: 0 18px; font: inherit; font-weight: 600; cursor: pointer; }
+  .primary:disabled { opacity: .5; cursor: default; }
+  .suggest { display: flex; gap: 8px; flex-wrap: wrap; padding: 0 12px 12px; }
+  .suggest button { border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 999px; padding: 6px 12px; font: inherit; font-size: 13px; cursor: pointer; }
+  aside { display: flex; flex-direction: column; gap: 16px; min-height: 0; overflow-y: auto; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 16px; box-shadow: var(--shadow); }
+  .panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 10px; }
+  .product { display: flex; justify-content: space-between; gap: 10px; padding: 8px 0; border-top: 1px solid var(--line); font-size: 14px; }
+  .product:first-of-type { border-top: 0; }
+  .product small { display: block; color: var(--muted); }
+  .stock0 { color: var(--err); font-size: 12px; }
+  .empty { color: var(--muted); font-size: 14px; }
+  dialog { border: 0; border-radius: 20px; padding: 0; width: min(420px, calc(100vw - 32px)); background: var(--panel); color: var(--ink); box-shadow: 0 20px 60px rgba(0,0,0,.35); }
+  dialog::backdrop { background: rgba(0,0,0,.45); }
+  .sheet { padding: 20px; }
+  .sheet .merchant { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+  .sheet .actions { display: flex; gap: 10px; margin-top: 18px; }
+  .sheet .actions button { flex: 1; height: 44px; }
+  .ghost { background: var(--chip); color: var(--ink); border: 0; border-radius: 12px; font: inherit; cursor: pointer; }
+  .note { font-size: 12px; color: var(--muted); margin-top: 10px; }
+  @media (max-width: 860px) {
+    main { grid-template-columns: 1fr; height: auto; padding: 16px; }
+    .chat { height: 72vh; }
+    .msg { max-width: 90%; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">B</div>
+  <h1>Brew &amp; Co · AI ile alışveriş</h1>
+  <div class="badges" id="badges"></div>
+  <button class="link" id="reset" title="Yeni sohbet">Yeni sohbet</button>
+</header>
+<main>
+  <section class="chat">
+    <div id="log"></div>
+    <div class="suggest" id="suggest">
+      <button>Filtre kahveye başlamak istiyorum, ne önerirsin?</button>
+      <button>2 paket kahve çekirdeği ve filtre kağıdı al, kargo hızlı olsun</button>
+      <button>Su ısıtıcısı var mı?</button>
+    </div>
+    <form id="form">
+      <textarea id="input" rows="1" placeholder="Ne almak istersin?" autofocus></textarea>
+      <button class="primary" id="send">Gönder</button>
+    </form>
+  </section>
+  <aside>
+    <div class="panel"><h2>Sepet</h2><div id="cart" class="empty">Henüz sepet yok.</div></div>
+    <div class="panel"><h2>Siparişler</h2><div id="orders" class="empty">Henüz sipariş yok.</div></div>
+    <div class="panel"><h2>Mağaza kataloğu</h2><div id="products"></div></div>
+  </aside>
+</main>
+<dialog id="sheet">
+  <div class="sheet">
+    <div class="merchant"><div class="logo">B</div><div><strong>Ödemeyi onayla</strong><div class="muted" style="font-size:13px">Brew &amp; Co · ajan senin adına ödeme yapmak istiyor</div></div></div>
+    <div id="sheet-lines"></div>
+    <div class="actions">
+      <button class="ghost" id="decline">Vazgeç</button>
+      <button class="primary" id="approve">Öde</button>
+    </div>
+    <div class="note">Ajan kart bilgisini görmez. Onay verirsen yalnızca bu tutar ve bu sepet için tek kullanımlık bir ödeme yetkisi oluşur.</div>
+  </div>
+</dialog>
+<script>
+const sid = (() => {
+  try {
+    let v = localStorage.getItem("sid");
+    if (!v) { v = crypto.randomUUID(); localStorage.setItem("sid", v); }
+    return v;
+  } catch { return crypto.randomUUID(); }
+})();
+const $ = (id) => document.getElementById(id);
+const log = $("log");
+const money = (minor, currency = "USD") => new Intl.NumberFormat("en-US", { style: "currency", currency }).format((minor ?? 0) / 100);
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const TOOL_LABELS = {
+  list_products: "Ürün kataloğuna baktı",
+  get_merchant_capabilities: "Mağazanın ödeme yöntemlerini okudu",
+  create_checkout_session: "Sepet oluşturdu", create_checkout: "Sepet oluşturdu",
+  update_checkout_session: "Sepeti güncelledi", update_checkout: "Sepeti güncelledi",
+  get_checkout_session: "Sepeti kontrol etti", get_checkout: "Sepeti kontrol etti",
+  pay_and_complete: "Ödemeyi başlattı, onayını bekliyor", pay_with_google_pay: "Google Pay ile ödemeyi başlattı",
+  cancel_checkout_session: "Sepeti iptal etti", cancel_checkout: "Sepeti iptal etti",
+};
+
+function md(text) {
+  const lines = esc(text).split("\n");
+  let html = "", inList = false;
+  for (const raw of lines) {
+    const line = raw.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>").replace(/`([^`]+)`/g, "<code>$1</code>");
+    const item = /^\s*[-*•]\s+(.*)$/.exec(line);
+    if (item) { if (!inList) { html += "<ul>"; inList = true; } html += `<li>${item[1]}</li>`; continue; }
+    if (inList) { html += "</ul>"; inList = false; }
+    html += line.trim() ? `<div>${line}</div>` : "<div style='height:6px'></div>";
+  }
+  return html + (inList ? "</ul>" : "");
+}
+
+function add(el) { log.appendChild(el); log.scrollTop = log.scrollHeight; return el; }
+function node(cls, html) { const d = document.createElement("div"); d.className = cls; d.innerHTML = html; return d; }
+let typing;
+function setTyping(on) {
+  if (on && !typing) typing = add(node("typing", "Ajan düşünüyor<span>.</span><span>.</span><span>.</span>"));
+  if (!on && typing) { typing.remove(); typing = undefined; }
+  if (typing) log.appendChild(typing);
+}
+function setBusy(b) { $("send").disabled = b; $("input").disabled = b; if (!b) $("input").focus(); }
+
+function cartHtml(c) {
+  const items = c.line_items.map((li) => `<div class="row"><span>${li.quantity} × ${esc(li.title)}</span><span>${money(li.subtotal ?? li.total, c.currency)}</span></div>`).join("");
+  const ship = c.fulfillment_options.find((o) => o.id === c.selected_fulfillment_option_id);
+  const errors = c.messages.filter((m) => m.type === "error" && !/missing/.test(m.code || "")).map((m) => `<div class="row err">${esc(m.content)}</div>`).join("");
+  const status = { ready_for_payment: "Ödemeye hazır", ready_for_complete: "Ödemeye hazır", completed: "Tamamlandı", canceled: "İptal edildi", in_progress: "Ödeme sürüyor", complete_in_progress: "Ödeme sürüyor" }[c.status] || "Hazırlanıyor";
+  return `${items || '<div class="empty">Sepet boş</div>'}
+    <div class="row muted"><span>${ship ? esc(ship.title) : "Kargo seçilmedi"}</span><span>${money(c.totals.fulfillment, c.currency)}</span></div>
+    <div class="row muted"><span>Vergi</span><span>${money(c.totals.tax, c.currency)}</span></div>
+    <div class="row total"><span>Toplam</span><span>${money(c.totals.total, c.currency)}</span></div>
+    ${errors}<div class="row muted" style="margin-top:6px"><span>Durum</span><span>${status}</span></div>`;
+}
+
+let currentApproval;
+function showApproval(ev) {
+  currentApproval = ev.id;
+  const rows = ev.summary.split("\n").filter((l) => l.trim()).map((l) => {
+    const parts = l.trim().split(/\s{2,}/);
+    const isTotal = /^Total/.test(parts[0]);
+    return `<div class="row${isTotal ? " total" : ""}"><span>${esc(parts[0].replace(/^Total/, "Toplam").replace(/^Tax/, "Vergi"))}${parts[2] ? `<br><small class="muted">${esc(parts[2].replace(/[()]/g, ""))}</small>` : ""}</span><span>${esc(parts[1] || "")}</span></div>`;
+  }).join("");
+  $("sheet-lines").innerHTML = rows;
+  const total = /Total\s+(\$[\d,.]+)/.exec(ev.summary);
+  $("approve").textContent = total ? `${total[1]} öde` : "Öde";
+  $("sheet").showModal();
+}
+async function answer(approved) {
+  $("sheet").close();
+  if (!currentApproval) return;
+  const id = currentApproval; currentApproval = undefined;
+  await fetch(`/api/approval?sid=${sid}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id, approved }) });
+}
+$("approve").onclick = () => answer(true);
+$("decline").onclick = () => answer(false);
+$("sheet").addEventListener("cancel", (e) => { e.preventDefault(); answer(false); });
+
+const seenOrders = new Set();
+function handle(ev) {
+  switch (ev.type) {
+    case "user": $("suggest").style.display = "none"; add(node("msg user", esc(ev.text))); setBusy(true); break;
+    case "thinking": setTyping(true); break;
+    case "tool": add(node("tool", esc(TOOL_LABELS[ev.name] || ev.name))); setTyping(true); break;
+    case "tool_error": add(node("tool err", `${esc(TOOL_LABELS[ev.name] || ev.name)}: ${esc(ev.error)}`)); break;
+    case "checkout": $("cart").className = ""; $("cart").innerHTML = cartHtml(ev.checkout); break;
+    case "approval": setTyping(false); showApproval(ev); break;
+    case "approval_result":
+      add(node("tool", ev.approved ? "Ödemeyi onayladın" : "Ödemeyi reddettin"));
+      if ($("sheet").open && currentApproval === ev.id) { $("sheet").close(); currentApproval = undefined; }
+      setTyping(true); break;
+    case "order": {
+      if (seenOrders.has(ev.order.id)) break;
+      seenOrders.add(ev.order.id);
+      const p = ev.payment || {};
+      const html = `<h3 class="ok">✓ Sipariş verildi · ${esc(ev.order.id)}</h3>
+        <div class="row"><span>Tahsil edilen</span><span>${money(ev.total, ev.currency)}</span></div>
+        ${p.pspReference ? `<div class="row muted"><span>${esc(p.provider || "ödeme")} referansı</span><span><code>${esc(p.pspReference)}</code></span></div>` : ""}
+        <div class="row">${p.dashboard ? `<a href="${esc(p.dashboard)}" target="_blank" rel="noopener">Stripe Dashboard'da gör ↗</a>` : "<span></span>"}<a href="${esc(ev.order.permalink_url)}" target="_blank" rel="noopener">Sipariş kaydı ↗</a></div>`;
+      add(node("card", html));
+      if ($("orders").classList.contains("empty")) { $("orders").className = ""; $("orders").innerHTML = ""; }
+      $("orders").appendChild(node("", html.replace("<h3", "<h3 style='font-size:13px'")));
+      break;
+    }
+    case "reply": setTyping(false); add(node("msg agent", md(ev.text))); break;
+    case "error": setTyping(false); add(node("msg agent", `<span class="err">Hata: ${esc(ev.text)}</span>`)); break;
+    case "idle": setTyping(false); setBusy(false); break;
+  }
+}
+
+async function send(text) {
+  if (!text.trim()) return;
+  $("input").value = "";
+  const r = await fetch(`/api/message?sid=${sid}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text }) });
+  if (!r.ok) add(node("tool err", (await r.json()).error || "Gönderilemedi"));
+}
+$("form").onsubmit = (e) => { e.preventDefault(); send($("input").value); };
+$("input").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send($("input").value); } });
+for (const b of $("suggest").querySelectorAll("button")) b.onclick = () => send(b.textContent);
+$("reset").onclick = async () => {
+  await fetch(`/api/reset?sid=${sid}`, { method: "POST" });
+  try { localStorage.removeItem("sid"); } catch {}
+  location.reload();
+};
+
+fetch(`/api/info?sid=${sid}`).then((r) => r.json()).then((i) => {
+  $("badges").innerHTML = [`Ajan: ${i.agent}`, `Protokol: ${i.protocol.toUpperCase()}`, `Ödeme: ${i.provider}`]
+    .map((t, n) => `<span class="badge${n === 2 && /test/.test(t) ? " live" : ""}">${esc(t)}</span>`).join("");
+});
+fetch("/api/products").then((r) => r.json()).then(({ products }) => {
+  $("products").innerHTML = products.map((p) => `<div class="product"><div>${esc(p.title)}<small>${esc(p.description)}</small></div><div style="text-align:right">${money(p.price, p.currency)}${p.stock === 0 ? '<div class="stock0">Tükendi</div>' : `<small>${p.stock} adet</small>`}</div></div>`).join("");
+});
+const events = new EventSource(`/api/events?sid=${sid}`);
+events.onmessage = (m) => handle(JSON.parse(m.data));
+</script>
+</body>
+</html>

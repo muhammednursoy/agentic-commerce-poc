@@ -10,7 +10,8 @@
     "servers": "node --env-file-if-exists=.env src/servers.ts",
     "agent": "node --env-file-if-exists=.env src/agent/cli.ts",
     "demo": "node --env-file-if-exists=.env src/demo.ts",
-    "stripe:live": "node --env-file-if-exists=.env src/stripe-live.ts",
+    "web": "node --env-file-if-exists=.env src/web/server.ts",
+    "stripe:live":"node --env-file-if-exists=.env src/stripe-live.ts",
     "test": "node --test test/*.test.ts",
     "typecheck": "tsc"
   },
