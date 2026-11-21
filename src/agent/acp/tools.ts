@@ -56,6 +56,7 @@ export class AcpToolset implements Toolset {
   readonly system: string;
   private readonly platform: AgentPlatform;
   private readonly confirm: Confirm;
+  private readonly pending = new Map<string, string>();
 
   constructor(platform: AgentPlatform, confirm: Confirm) {
     this.platform = platform;
@@ -67,6 +68,7 @@ export class AcpToolset implements Toolset {
       "Flow: list_products, create_checkout_session, pick a shipping option with update_checkout_session (standard unless the shopper asked for faster delivery), then pay_and_complete.",
       "If a tool result has error messages (out of stock, partial stock, unsupported destination, declined payment), explain it to the shopper and suggest an alternative instead of retrying blindly.",
       "pay_and_complete asks the shopper for approval itself; do not ask for card details, the platform holds the card.",
+      "If a pay result has status in_progress (message payment_pending) the payment may already have been taken: tell the shopper it is pending, call pay_and_complete again on the same session to re-check, and never create a new session for the same items.",
       `Saved shipping address: ${a.name}, ${a.line_one}, ${a.city} ${a.state} ${a.postal_code}, ${a.country}.`,
       "Reply in the shopper's language and keep replies short.",
     ].join("\n");
@@ -106,11 +108,21 @@ export class AcpToolset implements Toolset {
   private async payAndComplete(sessionId: string): Promise<unknown> {
     const session = await this.platform.getSession(sessionId);
     const summary = summarizeAcp(session);
+    if (session.status === "in_progress") {
+      const token = this.pending.get(sessionId);
+      return token ? this.complete(sessionId, token) : { error: "payment is pending at the merchant", session: summary };
+    }
     if (!summary.ready) return { error: `session is ${session.status}, not ready_for_payment`, session: summary };
     const approved = await this.confirm(describeForApproval(summary, `card •••• ${this.platform.shopper.card.number.slice(-4)}`));
     if (!approved) return { declined_by_shopper: true, session_id: sessionId };
-    const token = await this.platform.delegatePayment(session);
-    return summarizeAcp(await this.platform.completeSession(sessionId, token));
+    return this.complete(sessionId, await this.platform.delegatePayment(session));
+  }
+
+  private async complete(sessionId: string, token: string): Promise<CheckoutSummary> {
+    this.pending.set(sessionId, token);
+    const done = summarizeAcp(await this.platform.completeSession(sessionId, token));
+    if (done.status !== "in_progress") this.pending.delete(sessionId);
+    return done;
   }
 }
 

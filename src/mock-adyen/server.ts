@@ -45,6 +45,7 @@ export class MockAdyen {
   readonly tokens = new Map<string, TokenRecord>();
   readonly payments: Payment[] = [];
   private readonly requestedItems = new Map<string, Json>();
+  private readonly pendingFinalize = new Set<string>();
   private readonly idempotency = new Map<string, { hash: string; res: Res }>();
   private readonly merchantAccounts = new Set([config.merchantAccount]);
 
@@ -159,7 +160,8 @@ export class MockAdyen {
   private async completeSession(req: Req): Promise<Res> {
     const session = this.sessions.get(req.params.id);
     if (!session) return notFound();
-    if (session.status !== "ready_for_payment") {
+    const retry = session.status === "in_progress" && this.pendingFinalize.has(session.id);
+    if (!retry && session.status !== "ready_for_payment") {
       return { status: 200, body: { ...session, messages: [error("invalid_state", `session is ${session.status}`)] } };
     }
     const paymentData = req.body?.payment_data;
@@ -171,14 +173,17 @@ export class MockAdyen {
     if (req.body.buyer) session.buyer = { ...session.buyer, ...req.body.buyer };
 
     session.status = "in_progress";
-    const commit = await callJson("POST", `${config.merchantUrl}/agentic/sessions/${session.id}/commit`, {
-      label: "adyen→merchant",
-      headers: HOOK_HEADERS(),
-      body: { session },
-    });
-    if (!commit.body?.approved) {
-      session.status = "ready_for_payment";
-      return { status: 200, body: { ...session, messages: commit.body?.messages ?? [error("risk_rejected", "merchant rejected the order")] } };
+    this.pendingFinalize.delete(session.id);
+    if (!retry) {
+      const commit = await callJson("POST", `${config.merchantUrl}/agentic/sessions/${session.id}/commit`, {
+        label: "adyen→merchant",
+        headers: HOOK_HEADERS(),
+        body: { session },
+      });
+      if (!commit.body?.approved) {
+        session.status = "ready_for_payment";
+        return { status: 200, body: { ...session, messages: commit.body?.messages ?? [error("risk_rejected", "merchant rejected the order")] } };
+      }
     }
 
     const flow = config.merchantFlow;
@@ -208,6 +213,13 @@ export class MockAdyen {
       session.order = { id: result.order.id, checkout_session_id: session.id, permalink_url: result.order.permalink_url };
       session.messages = [];
       return { status: 200, body: session };
+    }
+    if (result.result_code === "Pending") {
+      this.pendingFinalize.add(session.id);
+      return {
+        status: 200,
+        body: { ...session, messages: [info("payment_pending", `The payment outcome is not known yet (${result.refusal_reason ?? "no reason given"}). Complete the session again to re-check.`)] },
+      };
     }
     session.status = "ready_for_payment";
     return {

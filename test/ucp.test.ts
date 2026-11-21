@@ -19,6 +19,7 @@ const { defaultShopper } = await import("../src/agent/shopper.ts");
 const { ScriptedAgent } = await import("../src/agent/llm/scripted.ts");
 const { encodeMockGooglePayToken } = await import("../src/google-pay-mock.ts");
 const { ucpTotal } = await import("../src/ucp.ts");
+const { signNotification } = await import("../src/adyen-hmac.ts");
 
 let adyen: InstanceType<typeof MockAdyen>;
 let merchant: InstanceType<typeof Merchant>;
@@ -69,7 +70,22 @@ function getCheckout(id: string) {
   return callJson("GET", `${base}/${id}`, { headers: agentHeaders });
 }
 
-type PaymentsHandler = (req: unknown) => unknown;
+type PaymentsHandler = (req: { headers: Record<string, string>; body: unknown }) => unknown;
+
+function gate() {
+  let open!: () => void;
+  const opened = new Promise<void>((resolve) => { open = resolve; });
+  return { opened, open };
+}
+
+function postWebhook(fields: Partial<import("../src/adyen-hmac.ts").NotificationRequestItem>) {
+  const item = {
+    amount: { value: 1, currency: "USD" }, eventCode: "AUTHORISATION", merchantAccountCode: config.merchantAccount,
+    merchantReference: "x", pspReference: "y", success: "true" as const, reason: "", additionalData: {} as Record<string, string>, ...fields,
+  };
+  item.additionalData.hmacSignature = signNotification(item, config.webhookHmacKey);
+  return callJson("POST", `${config.merchantUrl}/adyen/webhooks`, { body: { live: "false", notificationItems: [{ NotificationRequestItem: item }] } });
+}
 
 async function withAdyen(wrap: (original: PaymentsHandler) => PaymentsHandler, run: () => Promise<void>) {
   const mock = adyen as unknown as { checkoutPayments: PaymentsHandler };
@@ -92,6 +108,7 @@ describe("discovery", () => {
     assert.equal(res.status, 200);
     assert.equal(res.body.ucp.version, "2026-01-23");
     assert.equal(res.body.ucp.services["dev.ucp.shopping"][0].endpoint, `${config.merchantUrl}/ucp/v1`);
+    assert.equal(res.body.ucp.services["dev.ucp.shopping"][0].schema, "https://ucp.dev/2026-01-23/services/shopping/openapi.json");
     const handler = res.body.ucp.payment_handlers["com.google.pay"][0];
     const tokenization = handler.config.allowed_payment_methods[0].tokenization_specification;
     assert.deepEqual(tokenization, { type: "PAYMENT_GATEWAY", parameters: { gateway: "adyen", gatewayMerchantId: config.merchantAccount } });
@@ -297,43 +314,121 @@ describe("Adyen faults and races during complete", () => {
     assert.equal(merchant.orders.get(after.body.order.id)!.amount, ucpTotal(checkout));
   });
 
-  test("Adyen times out: retrying with the same instrument charges once", async () => {
+  test("Adyen times out: retrying with the same instrument re-sends the identical request and charges once", async () => {
     const checkout = await readyCheckout();
     const body = { payment: { instruments: [instrument(checkout)] } };
     const before = adyen.payments.length;
     const c = config as { checkoutTimeoutMs: number };
     const timeout = c.checkoutTimeoutMs;
-    c.checkoutTimeoutMs = 50;
-    try {
-      await withAdyen(() => async () => {
-        await sleep(200);
-        return { status: 503, body: { status: 503, message: "unavailable" } };
-      }, async () => {
+    const hang = gate();
+    const seen: { key: string; body: string }[] = [];
+    await withAdyen((original) => async (req) => {
+      seen.push({ key: req.headers["idempotency-key"], body: JSON.stringify(req.body) });
+      if (seen.length > 1) return original(req);
+      await hang.opened;
+      return { status: 503, body: { status: 503, message: "unavailable" } };
+    }, async () => {
+      c.checkoutTimeoutMs = 50;
+      try {
         const res = await complete(checkout.id, body);
         assert.equal(res.body.status, "complete_in_progress");
         assert.equal(res.body.messages.at(-1).code, "payment_pending");
-      });
-    } finally {
-      c.checkoutTimeoutMs = timeout;
-    }
-    const retry = await complete(checkout.id, body);
-    assert.equal(retry.body.status, "completed");
+      } finally {
+        c.checkoutTimeoutMs = timeout;
+      }
+      const retry = await complete(checkout.id, body);
+      assert.equal(retry.body.status, "completed");
+      hang.open();
+    });
+    assert.equal(seen.length, 2);
+    assert.deepEqual(seen[1], seen[0]);
     assert.equal(adyen.payments.length, before + 1);
   });
 
   test("cancel while complete is in flight is refused and the payment completes", async () => {
     const checkout = await readyCheckout();
+    const reached = gate();
+    const release = gate();
     await withAdyen((original) => async (req) => {
-      await sleep(150);
+      reached.open();
+      await release.opened;
       return original(req);
     }, async () => {
       const paying = complete(checkout.id, { payment: { instruments: [instrument(checkout)] } });
-      await sleep(30);
+      await reached.opened;
       const cancel = await callJson("POST", `${base}/${checkout.id}/cancel`, { headers: agentHeaders, body: {} });
       assert.equal(cancel.status, 409);
+      release.open();
       assert.equal((await paying).body.status, "completed");
     });
     assert.equal((await getCheckout(checkout.id)).body.status, "completed");
+  });
+
+  test("a late response for an earlier attempt does not clobber the next attempt", async () => {
+    const checkout = await readyCheckout();
+    const body = { payment: { instruments: [instrument(checkout)] } };
+    const [reached1, release1, reached2, release2] = [gate(), gate(), gate(), gate()];
+    let calls = 0;
+    await withAdyen((original) => async (req) => {
+      calls += 1;
+      if (calls === 1) {
+        reached1.open();
+        await release1.opened;
+        return { status: 200, body: { pspReference: "LATE1", resultCode: "Refused", refusalReason: "Refused" } };
+      }
+      reached2.open();
+      await release2.opened;
+      return original(req);
+    }, async () => {
+      const first = complete(checkout.id, body);
+      await reached1.opened;
+      const reference = merchant.ucp.sessions.get(checkout.id)!.pending!.orderId;
+      assert.equal((await postWebhook({ merchantReference: reference, pspReference: "LATE1", success: "false", reason: "Refused" })).status, 200);
+      const second = complete(checkout.id, body);
+      await reached2.opened;
+      release1.open();
+      await first;
+      release2.open();
+      assert.equal((await second).body.status, "completed");
+    });
+    const after = await getCheckout(checkout.id);
+    assert.equal(after.body.status, "completed");
+    assert.ok(merchant.orders.get(after.body.order.id));
+  });
+
+  test("Adyen unreachable or rejecting the API key is payment_failed, not a card decline", async () => {
+    const checkout = await readyCheckout();
+    const body = { payment: { instruments: [instrument(checkout)] } };
+    const c = config as { checkoutBase: string };
+    const checkoutBase = c.checkoutBase;
+    c.checkoutBase = "http://127.0.0.1:18099/v72";
+    try {
+      const unreachable = await complete(checkout.id, body);
+      assert.equal(unreachable.body.status, "ready_for_complete");
+      assert.equal(unreachable.body.messages.at(-1).code, "payment_failed");
+    } finally {
+      c.checkoutBase = checkoutBase;
+    }
+    await withAdyen(() => () => ({ status: 401, body: { status: 401, errorCode: "000", message: "Unauthorized", errorType: "security" } }), async () => {
+      const rejected = await complete(checkout.id, body);
+      assert.equal(rejected.body.status, "ready_for_complete");
+      assert.equal(rejected.body.messages.at(-1).code, "payment_failed");
+      assert.doesNotMatch(rejected.body.messages.at(-1).content, /another card/);
+    });
+    assert.equal((await complete(checkout.id, body)).body.status, "completed");
+  });
+
+  test("webhooks for unknown references and duplicate webhooks change nothing", async () => {
+    const checkout = await readyCheckout();
+    const res = await complete(checkout.id, { payment: { instruments: [instrument(checkout)] } });
+    const order = merchant.orders.get(res.body.order.id)!;
+    const ordersBefore = merchant.orders.size;
+    assert.equal((await postWebhook({ merchantReference: "ord_unknown", pspReference: "UNKNOWN1" })).status, 200);
+    for (let i = 0; i < 2; i++) {
+      assert.equal((await postWebhook({ merchantReference: order.id, pspReference: order.pspReference, amount: { value: order.amount, currency: "USD" } })).status, 200);
+    }
+    assert.equal(merchant.orders.size, ordersBefore);
+    assert.deepEqual(order.webhookEvents, ["AUTHORISATION:true"]);
   });
 
   test("the same token can be retried after a decline (fixed test-mode token)", async () => {
@@ -351,16 +446,28 @@ describe("Adyen faults and races during complete", () => {
     });
   });
 
-  test("concurrent completes with the same Idempotency-Key share one result", async () => {
+  test("a duplicate complete while the first is in flight gets 409; after it, the key replays the result", async () => {
     const checkout = await readyCheckout();
     const body = { payment: { instruments: [instrument(checkout)] } };
     const before = adyen.payments.length;
-    const [a, b] = await Promise.all([
-      complete(checkout.id, body, { "idempotency-key": "k-concurrent" }),
-      complete(checkout.id, body, { "idempotency-key": "k-concurrent" }),
-    ]);
-    assert.equal(a.body.status, "completed");
-    assert.deepEqual(b.body, a.body);
+    const reached = gate();
+    const release = gate();
+    let first: Awaited<ReturnType<typeof complete>> | undefined;
+    await withAdyen((original) => async (req) => {
+      reached.open();
+      await release.opened;
+      return original(req);
+    }, async () => {
+      const paying = complete(checkout.id, body, { "idempotency-key": "k-concurrent" });
+      await reached.opened;
+      const duplicate = await complete(checkout.id, body, { "idempotency-key": "k-concurrent" });
+      assert.equal(duplicate.status, 409);
+      release.open();
+      first = await paying;
+    });
+    assert.equal(first!.body.status, "completed");
+    const replay = await complete(checkout.id, body, { "idempotency-key": "k-concurrent" });
+    assert.deepEqual(replay.body, first!.body);
     assert.equal(adyen.payments.length, before + 1);
   });
 });
@@ -370,12 +477,21 @@ describe("stock", () => {
     addProduct("sku_last_one", 1000, 1);
     const a = await readyCheckout(new UcpPlatform(), [{ id: "sku_last_one", quantity: 1 }]);
     const b = await readyCheckout(new UcpPlatform(), [{ id: "sku_last_one", quantity: 1 }]);
-    const results = await Promise.all([a, b].map((c) => complete(c.id, { payment: { instruments: [instrument(c)] } })));
-    const completed = results.filter((r) => r.body.status === "completed");
-    const refused = results.filter((r) => r.status === 409);
-    assert.equal(completed.length, 1);
-    assert.equal(refused.length, 1);
-    assert.equal(refused[0].body.messages[0].code, "out_of_stock");
+    const reached = gate();
+    const release = gate();
+    await withAdyen((original) => async (req) => {
+      reached.open();
+      await release.opened;
+      return original(req);
+    }, async () => {
+      const first = complete(a.id, { payment: { instruments: [instrument(a)] } });
+      await reached.opened;
+      const second = await complete(b.id, { payment: { instruments: [instrument(b)] } });
+      assert.equal(second.status, 409);
+      assert.equal(second.body.messages[0].code, "out_of_stock");
+      release.open();
+      assert.equal((await first).body.status, "completed");
+    });
     assert.equal(merchant.catalog.get("sku_last_one")!.stock, 0);
   });
 
@@ -433,6 +549,29 @@ describe("agent tools", () => {
     const out = await toolset.execute("pay_with_google_pay", { checkout_id: checkout.id }) as { error?: string };
     assert.match(out.error ?? "", /total changed/);
     assert.equal(adyen.payments.length, before);
+  });
+
+  test("the pay tool re-checks a pending checkout with the same instrument and no second approval", async () => {
+    const platform = new UcpPlatform();
+    const checkout = await readyCheckout(platform);
+    let approvals = 0;
+    const toolset = new UcpToolset(platform, async () => {
+      approvals += 1;
+      return true;
+    });
+    const before = adyen.payments.length;
+    let calls = 0;
+    await withAdyen((original) => (req) => {
+      calls += 1;
+      return calls === 1 ? { status: 503, body: { status: 503, message: "unavailable" } } : original(req);
+    }, async () => {
+      const first = await toolset.execute("pay_with_google_pay", { checkout_id: checkout.id }) as { status?: string };
+      assert.equal(first.status, "complete_in_progress");
+      const second = await toolset.execute("pay_with_google_pay", { checkout_id: checkout.id }) as { status?: string };
+      assert.equal(second.status, "completed");
+    });
+    assert.equal(approvals, 1);
+    assert.equal(adyen.payments.length, before + 1);
   });
 
   test("bad tool input and an unreachable merchant come back as { error } instead of throwing", async () => {

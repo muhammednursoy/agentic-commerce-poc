@@ -17,6 +17,20 @@ const { defaultShopper } = await import("../src/agent/shopper.ts");
 const { AcpToolset } = await import("../src/agent/acp/tools.ts");
 const { ScriptedAgent, pickItems } = await import("../src/agent/llm/scripted.ts");
 const { sessionTotal } = await import("../src/acp.ts");
+const { redact } = await import("../src/http.ts");
+
+type PaymentsHandler = (req: unknown) => unknown;
+
+async function withAdyen(wrap: (original: PaymentsHandler) => PaymentsHandler, run: () => Promise<void>) {
+  const mock = adyen as unknown as { checkoutPayments: PaymentsHandler };
+  const original = mock.checkoutPayments.bind(adyen);
+  mock.checkoutPayments = wrap(original);
+  try {
+    await run();
+  } finally {
+    delete (mock as Partial<typeof mock>).checkoutPayments;
+  }
+}
 
 let adyen: InstanceType<typeof MockAdyen>;
 let merchant: InstanceType<typeof Merchant>;
@@ -109,6 +123,12 @@ describe("checkout session lifecycle", () => {
       body: { currency: "USD", items: [{ id: "sku_filters", quantity: 1 }] },
     });
     assert.equal(res.status, 401);
+  });
+
+  test("the same product on two lines is rejected instead of quoted", async () => {
+    const session = await readySession(new AgentPlatform(), [{ id: "sku_filters", quantity: 2 }, { id: "sku_filters", quantity: 3 }]);
+    assert.equal(session.status, "not_ready_for_payment");
+    assert.ok(session.messages.some((m) => m.code === "invalid_item"));
   });
 
   test("canceled session cannot be completed", async () => {
@@ -242,6 +262,35 @@ describe("agent end to end", () => {
     assert.equal(result.messages[0].code, "payment_declined");
   });
 
+  test("advanced flow: Adyen authorises but answers 500, the retry re-sends the same payment and charges once", async () => {
+    const platform = new AgentPlatform();
+    const session = await readySession(platform);
+    let approvals = 0;
+    const toolset = new AcpToolset(platform, async () => {
+      approvals += 1;
+      return true;
+    });
+    const paymentsBefore = adyen.payments.length;
+    const ordersBefore = merchant.orders.size;
+    let calls = 0;
+    await withAdyen((original) => (req) => {
+      calls += 1;
+      const res = original(req);
+      return calls === 1 ? { status: 500, body: { status: 500, errorCode: "905", message: "Internal error", errorType: "internal" } } : res;
+    }, async () => {
+      const first = await toolset.execute("pay_and_complete", { session_id: session.id }) as { status?: string; messages?: { code: string }[] };
+      assert.equal(first.status, "in_progress");
+      assert.equal(first.messages?.[0].code, "payment_pending");
+      assert.equal((await platform.cancelSession(session.id)).messages[0].code, "invalid_state");
+      const second = await toolset.execute("pay_and_complete", { session_id: session.id }) as { status?: string };
+      assert.equal(second.status, "completed");
+    });
+    assert.equal(calls, 2);
+    assert.equal(adyen.payments.length, paymentsBefore + 1);
+    assert.equal(merchant.orders.size, ordersBefore + 1);
+    assert.equal(approvals, 1);
+  });
+
   test("delegate errors surface as AdyenApiError", async () => {
     const shopper = defaultShopper();
     shopper.card = { ...shopper.card, number: "41" };
@@ -262,6 +311,25 @@ describe("merchant ACP hooks", () => {
     for (const path of ["/agentic/quote", "/agentic/sessions/cs_forged/commit", "/agentic/sessions/cs_forged/finalize"]) {
       const res = await callJson("POST", `${config.merchantUrl}${path}`, { body: forged });
       assert.equal(res.status, 401, path);
+    }
+  });
+
+  test("with no hook secret (the test-mode default) every hook call is rejected", async () => {
+    process.env.ADYEN_MODE = "test";
+    try {
+      const fresh = await import(new URL("../src/config.ts?test-mode", import.meta.url).href);
+      assert.equal(fresh.config.merchantHookSecret, "");
+    } finally {
+      delete process.env.ADYEN_MODE;
+    }
+    const c = config as { merchantHookSecret: string };
+    const secret = c.merchantHookSecret;
+    c.merchantHookSecret = "";
+    try {
+      const res = await callJson("POST", `${config.merchantUrl}/agentic/quote`, { headers: { authorization: "Bearer " }, body: forged });
+      assert.equal(res.status, 401);
+    } finally {
+      c.merchantHookSecret = secret;
     }
   });
 
@@ -289,6 +357,11 @@ describe("merchant ACP hooks", () => {
       c.merchantFlow = "advanced";
     }
   });
+});
+
+test("the trace masks the ACP token under every key it appears in", () => {
+  const shown = redact('{"token":"TOK1","storedPaymentMethodId":"TOK1","recurringDetailReference":"TOK1"}');
+  assert.doesNotMatch(shown, /TOK1/);
 });
 
 test("pickItems reads quantities from free text", () => {

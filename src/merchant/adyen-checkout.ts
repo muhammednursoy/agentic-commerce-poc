@@ -10,6 +10,11 @@ export interface PaymentResult {
 }
 
 export const UNKNOWN_OUTCOME = "Unknown";
+const NOT_CONNECTED = new Set(["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN"]);
+
+export function isOutcomeUnknown(resultCode: string): boolean {
+  return resultCode === UNKNOWN_OUTCOME || resultCode === "Pending" || resultCode === "Received";
+}
 
 export async function makePayment(body: Record<string, unknown>, idempotencyKey: string): Promise<PaymentResult> {
   let res: CallResult;
@@ -21,6 +26,8 @@ export async function makePayment(body: Record<string, unknown>, idempotencyKey:
       signal: AbortSignal.timeout(config.checkoutTimeoutMs),
     });
   } catch (err) {
+    const code = (err as { cause?: { code?: string } }).cause?.code;
+    if (code && NOT_CONNECTED.has(code)) return { resultCode: "Error", refusalReason: `Adyen unreachable (${code})` };
     return { resultCode: UNKNOWN_OUTCOME, refusalReason: err instanceof Error ? err.message : String(err) };
   }
   if (res.status >= 500 || (res.status === 422 && res.body?.errorCode === "704")) {

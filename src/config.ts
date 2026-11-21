@@ -30,7 +30,7 @@ export const config = {
   delegatePaymentApiVersion: "2025-09-29",
   merchantUrl: env.MERCHANT_URL || `http://localhost:${MERCHANT_PORT}`,
   merchantFlow: env.MERCHANT_FLOW === "standard" ? "standard" : "advanced",
-  merchantHookSecret: env.MERCHANT_HOOK_SECRET || "mock_merchant_hook_secret",
+  merchantHookSecret: env.MERCHANT_HOOK_SECRET || (mode === "mock" ? "mock_merchant_hook_secret" : ""),
   webhookHmacKey: env.ADYEN_HMAC_KEY || (mode === "mock" ? "44782DEF547AAA06C910C43932B1EB0C71FC68D9D0C057550C48EC2ACF6BA056" : ""),
   webhookInsecure: env.ADYEN_WEBHOOK_INSECURE === "1",
   googlePayMerchantId: env.GOOGLE_PAY_MERCHANT_ID || "BCR2DN4TEST000000",

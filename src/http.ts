@@ -81,7 +81,7 @@ export interface CallResult {
   body: Json;
 }
 
-const SENSITIVE = /("(number|cvc|cryptogram|googlePayToken|token|exp_month|exp_year|name)":\s*")((?:[^"\\]|\\.)*)(")/g;
+const SENSITIVE = /("(number|cvc|cryptogram|googlePayToken|token|storedPaymentMethodId|recurringDetailReference|exp_month|exp_year|name)":\s*")((?:[^"\\]|\\.)*)(")/g;
 
 export function redact(text: string): string {
   return text.replace(SENSITIVE, (_, open: string, key: string, value: string, close: string) =>

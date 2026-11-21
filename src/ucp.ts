@@ -137,7 +137,7 @@ export interface UcpCheckout {
 export interface UcpProfile {
   ucp: {
     version: string;
-    services: Record<string, { version: string; spec: string; transport: "rest"; endpoint: string }[]>;
+    services: Record<string, { version: string; spec: string; transport: "rest"; endpoint: string; schema?: string }[]>;
     capabilities: Record<string, { version: string; spec: string; extends?: string }[]>;
     payment_handlers: Record<string, GooglePayHandler[]>;
   };

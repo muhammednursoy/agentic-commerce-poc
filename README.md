@@ -35,17 +35,18 @@ Adyen's agentic endpoints and Google's agent surfaces need onboarding, so the re
 5. **Outcome.**
    - `Authorised` → `completed` with `order.id` and `order.permalink_url`. The completed checkout is frozen at the charged total.
    - `Refused` → stays `ready_for_complete` with a recoverable `payment_declined` message; the agent asks the shopper and may retry with a new token.
+   - `Error` (Adyen answered 4xx, for example a bad API key, or could not be reached at all) → stays `ready_for_complete` with `payment_failed`: nothing was charged, and the message does not ask for another card.
    - `RedirectShopper` (3-D Secure) → `requires_escalation` with a `continue_url`.
-   - Unknown outcome (timeout, network error, HTTP 5xx, Adyen 422/704) → stays `complete_in_progress` with an info `payment_pending` message. A `complete` with the same instrument resends the identical `/payments` request (same `reference` and idempotency key); the `AUTHORISATION` webhook also settles it. A different instrument and `cancel` get 409 meanwhile.
+   - Unknown outcome (timeout, connection reset, HTTP 5xx, Adyen 422/704, result code `Pending` or `Received`) → stays `complete_in_progress` with an info `payment_pending` message. A `complete` with the same instrument resends the identical `/payments` request (same `reference` and idempotency key); the `AUTHORISATION` webhook also settles it. A different instrument and `cancel` get 409 meanwhile. The bundled pay tool keeps the instrument of a pending checkout and, when called again on it, re-sends that same instrument without asking the shopper again. If neither a retry nor a webhook arrives the checkout stays `complete_in_progress` with its stock reserved: it does not expire and cannot be canceled, by design, because the payment may have been taken.
    - Orders above the risk limit also escalate (`high_value_order`).
-   - Stock is reserved for the duration of the Adyen call, so concurrent checkouts cannot oversell.
-6. **Webhook.** Adyen posts an `AUTHORISATION` notification; the merchant verifies its HMAC signature and attaches it to the order. Without `ADYEN_HMAC_KEY` every webhook is rejected (`ADYEN_WEBHOOK_INSECURE=1` opts out).
+   - Stock is reserved for the duration of the Adyen call, so concurrent checkouts cannot oversell. Reservations have no time limit; only a definitive result releases them.
+6. **Webhook.** Adyen posts an `AUTHORISATION` notification; the merchant verifies its HMAC signature and attaches it to the order. Without `ADYEN_HMAC_KEY` every webhook is rejected (`ADYEN_WEBHOOK_INSECURE=1` opts out), so a pending payment then settles only when the agent retries `complete`.
 
 The LLM never sees card data. Its payment tool takes only a checkout id, and the platform runs the approval step and the token step. After the shopper approves, the tool re-reads the checkout and refuses to complete if the total or currency changed, and it reports an error if the completed total differs from the approved one.
 
 ## ACP flow
 
-The agent creates and updates the checkout session on Adyen's Commerce Suite, which asks the merchant for quotes. It tokenizes the card with `delegate_payment`: the token is single use, bound to the session and the merchant, and capped by `max_amount`. Completing the session makes Adyen call the merchant's commit and finalize hooks, authenticated with `Authorization: Bearer $MERCHANT_HOOK_SECRET`. Commit re-quotes, reserves stock and records the approved total; finalize charges only that approved total and refuses a session without an approved commit. In the advanced flow (the default) the merchant charges the token with `POST /payments`. Run it with `PROTOCOL=acp`.
+The agent creates and updates the checkout session on Adyen's Commerce Suite, which asks the merchant for quotes. It tokenizes the card with `delegate_payment`: the token is single use, bound to the session and the merchant, and capped by `max_amount`. Completing the session makes Adyen call the merchant's commit and finalize hooks, authenticated with `Authorization: Bearer $MERCHANT_HOOK_SECRET`. Commit re-quotes, reserves stock and records the approved total; finalize charges only that approved total and refuses a session without an approved commit. The same product on two lines is rejected at quote time (`invalid_item`). In the advanced flow (the default) the merchant charges the token with `POST /payments`. On an unknown outcome finalize answers `result_code: "Pending"` and keeps the approval and the stock reservation; the mock Commerce Suite leaves the session `in_progress` with an info `payment_pending` message, and completing it again calls finalize without a new commit, which re-sends the identical `/payments` request. The bundled `pay_and_complete` tool does that with the token it already has. ACP webhooks are only attached to orders; they do not settle a pending ACP payment, so a pending session with no retry stays `in_progress` with its stock reserved. Run it with `PROTOCOL=acp`.
 
 ## Run
 
@@ -55,7 +56,7 @@ Requires Node 23.6+ (TypeScript runs natively, no build step).
 npm install
 npm run demo                 # UCP + Google Pay, scripted agent, auto-approved, full HTTP trace
 PROTOCOL=acp npm run demo    # same purchase over ACP
-npm test                     # 57 contract and end-to-end tests
+npm test                     # 65 contract and end-to-end tests
 ```
 
 Chat with a real agent. Start the servers in one terminal:
@@ -99,7 +100,7 @@ GOOGLE_PAY_TOKEN=@token.json npm run servers
 
 Generate `token.json` with Google's Google Pay Code Generator, using gateway `adyen` and your merchant account as `gatewayMerchantId`. The token binds the gateway merchant and an expiry, not an amount: Adyen charges whatever amount the merchant sends. This proves the merchant → Adyen leg for real. Having real Gemini or AI Mode call your UCP endpoints requires Google's merchant onboarding and a public HTTPS endpoint, which a local POC cannot simulate.
 
-ACP path: also set `ADYEN_COMPANY_ACCOUNT`, `ADYEN_COMMERCE_SUITE_API_KEY` and `ADYEN_AGENTIC_TOKEN`. Adyen must enable Delegated Payment and the agentic token for your account.
+ACP path: also set `ADYEN_COMPANY_ACCOUNT`, `ADYEN_COMMERCE_SUITE_API_KEY`, `ADYEN_AGENTIC_TOKEN` and `MERCHANT_HOOK_SECRET`. With `ADYEN_MODE=test` there is no default hook secret, and without one every hook call is rejected. Adyen must enable Delegated Payment and the agentic token for your account.
 
 | Call | Test host | Auth |
 |---|---|---|
@@ -112,13 +113,15 @@ ACP path: also set `ADYEN_COMPANY_ACCOUNT`, `ADYEN_COMMERCE_SUITE_API_KEY` and `
 Taken from the docs:
 
 - UCP 2026-01-23: checkout endpoints and statuses, PUT full replacement, message severities, `PAYMENT_GATEWAY` credential at `payment.instruments[].credential.token`, the `com.google.pay` handler declaration.
+- UCP discovery profile `services` entry: an array of objects with `version`, `spec`, `transport: "rest"`, `endpoint` and `schema`, as in the overview page's profile example. The same page's field table describes a nested `rest.endpoint`, so the page is inconsistent; the repo follows the example.
 - Adyen Google flow: `googlepay` + `googlePayToken`, `metadata.agentProtocol/agentSessionId/agentPlatform`, gateway `adyen`.
 - ACP: endpoints, headers, `delegate_payment` request fields, token scoping.
 
 Assumed, to confirm before production:
 
-- UCP field details that only appeared in summarised spec text: the postal address field names, the shape of the `ucp` envelope in responses, and the discovery profile's `services` entry (`transport`, `endpoint`).
-- Known UCP deviations: the spec lists `Idempotency-Key`, `Request-Id` and `Request-Signature` as required headers, the merchant requires only `UCP-Agent`; create accepts a `currency` field; error bodies carry `messages` without a top-level `status`; `continue_url` is sent only for `requires_escalation`.
+- UCP field details that only appeared in summarised spec text: the postal address field names and the shape of the `ucp` envelope in responses.
+- Known UCP deviations: the spec lists `Idempotency-Key`, `Request-Id` and `Request-Signature` as required headers, the merchant requires only `UCP-Agent`; create accepts a `currency` field; error bodies carry `messages` without a top-level `status`; `continue_url` is sent only for `requires_escalation`, not for `complete_in_progress` where the spec says it SHOULD be present; version negotiation (`version_unsupported`) is not implemented, the merchant only checks that `UCP-Agent` is present.
+- A second `complete` with the same `Idempotency-Key` while the first is still running gets 409; once the first has a definitive result the key replays it.
 - `Request-Signature` verification and `signing_keys` are not implemented.
 - The mock decrypts nothing. Its Google Pay token wraps a base64 JSON payload. The mock enforces the gateway merchant and expiry, which a real token binds cryptographically, and also the amount, which a real token does not carry; the mock's amount check is a stand-in, the real guard is the platform-side total check in the pay tool.
 - ACP: the merchant hook paths, bodies and their bearer-secret authentication (`/agentic/quote`, commit, finalize); the `/payments` fields of the advanced flow (`paymentMethod.type: "scheme"`, `storedPaymentMethodId`, `shopperReference`, `shopperInteraction: ContAuth`, `recurringProcessingModel: UnscheduledCardOnFile`); `risk_signals` as an array; and the mock's `delegate_payment` responses: 201 with `created`/`metadata` (Adyen documents 200 with `id` and `expires_at`) and 400 `invalid_card` / `idempotency_conflict` errors (Adyen lists 401/403/422 without that envelope).

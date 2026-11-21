@@ -24,7 +24,7 @@ import type {
   UcpStatus,
 } from "../ucp.ts";
 import type { Item } from "../acp.ts";
-import { UNKNOWN_OUTCOME, makePayment } from "./adyen-checkout.ts";
+import { isOutcomeUnknown, makePayment } from "./adyen-checkout.ts";
 import type { PaymentResult } from "./adyen-checkout.ts";
 import { RISK_LIMIT } from "./store.ts";
 import type { MerchantStore, PriceProblem } from "./store.ts";
@@ -97,7 +97,6 @@ export class UcpMerchant {
   readonly sessions = new Map<string, SessionState>();
   private readonly store: MerchantStore;
   private readonly idempotency = new Map<string, { hash: string; res: Res }>();
-  private readonly inflight = new Map<string, { hash: string; promise: Promise<Res> }>();
 
   constructor(store: MerchantStore) {
     this.store = store;
@@ -120,7 +119,7 @@ export class UcpMerchant {
     return {
       ucp: {
         version: UCP_VERSION,
-        services: { [SHOPPING_SERVICE]: [{ version: UCP_VERSION, spec: `${spec}/overview`, transport: "rest", endpoint: `${config.merchantUrl}${UCP_BASE_PATH}` }] },
+        services: { [SHOPPING_SERVICE]: [{ version: UCP_VERSION, spec: `${spec}/overview`, transport: "rest", endpoint: `${config.merchantUrl}${UCP_BASE_PATH}`, schema: `https://ucp.dev/${UCP_VERSION}/services/shopping/openapi.json` }] },
         capabilities: {
           [CHECKOUT_CAPABILITY]: [{ version: UCP_VERSION, spec: `${spec}/checkout` }],
           [FULFILLMENT_CAPABILITY]: [{ version: UCP_VERSION, spec: `${spec}/fulfillment`, extends: CHECKOUT_CAPABILITY }],
@@ -137,20 +136,14 @@ export class UcpMerchant {
     if (req.method === "GET" || typeof key !== "string") return next();
     const scope = `${req.method} ${req.path} ${key}`;
     const hash = createHash("sha256").update(JSON.stringify(req.body ?? {})).digest("hex");
-    const seen = this.idempotency.get(scope) ?? this.inflight.get(scope);
+    const seen = this.idempotency.get(scope);
     if (seen) {
       if (seen.hash !== hash) return fail(409, "idempotency_conflict", "Idempotency-Key reused with a different body");
-      return "res" in seen ? seen.res : seen.promise;
+      return seen.res;
     }
-    const promise = (async () => next())();
-    this.inflight.set(scope, { hash, promise });
-    try {
-      const res = await promise;
-      if (res.status < 500 && res.body?.status !== "complete_in_progress") this.idempotency.set(scope, { hash, res });
-      return res;
-    } finally {
-      this.inflight.delete(scope);
-    }
+    const res = await next();
+    if (res.status < 500 && res.status !== 409 && res.body?.status !== "complete_in_progress") this.idempotency.set(scope, { hash, res });
+    return res;
   }
 
   private create(req: Req): Res {
@@ -219,7 +212,8 @@ export class UcpMerchant {
     const tokenHash = createHash("sha256").update(instrument.credential.token).digest("hex").slice(0, 16);
     if (retry) {
       const pending = state.pending;
-      if (!pending || pending.inFlight || pending.tokenHash !== tokenHash) {
+      if (pending?.inFlight) return fail(409, "invalid_state", "a payment for this checkout is in flight");
+      if (!pending || pending.tokenHash !== tokenHash) {
         return fail(409, "invalid_state", "checkout is complete_in_progress; only the same payment instrument can be retried");
       }
       return this.charge(state, pending);
@@ -261,7 +255,7 @@ export class UcpMerchant {
     pending.inFlight = true;
     const result = await makePayment(pending.body, `${state.id}-${pending.orderId}`);
     pending.inFlight = false;
-    this.settle(state, result);
+    if (state.pending === pending) this.settle(state, result);
     return { status: 200, body: this.view(state) };
   }
 
@@ -275,7 +269,7 @@ export class UcpMerchant {
   private settle(state: SessionState, result: PaymentResult): void {
     const pending = state.pending;
     if (state.sticky !== "complete_in_progress" || !pending) return;
-    if (result.resultCode === UNKNOWN_OUTCOME) {
+    if (isOutcomeUnknown(result.resultCode)) {
       state.paymentMessages = [{
         type: "info",
         code: "payment_pending",
@@ -306,13 +300,20 @@ export class UcpMerchant {
       this.escalate(state, "requires_3ds", "requires_buyer_input", "The card issuer requires 3-D Secure authentication", result.action);
       return;
     }
-    state.paymentMessages = [{
-      type: "error",
-      code: "payment_declined",
-      severity: "recoverable",
-      content: `Payment was not authorised: ${result.refusalReason ?? result.resultCode}. Try another card.`,
-      path: "$.payment.instruments[0]",
-    }];
+    state.paymentMessages = [result.resultCode === "Error"
+      ? {
+          type: "error",
+          code: "payment_failed",
+          severity: "recoverable",
+          content: `The merchant could not process the payment; nothing was charged (${result.refusalReason ?? "Error"}).`,
+        }
+      : {
+          type: "error",
+          code: "payment_declined",
+          severity: "recoverable",
+          content: `Payment was not authorised: ${result.refusalReason ?? result.resultCode}. Try another card.`,
+          path: "$.payment.instruments[0]",
+        }];
   }
 
   private cancel(req: Req): Res {
@@ -364,9 +365,8 @@ export class UcpMerchant {
     else if (pricing.options.length && !pricing.chosen) {
       messages.push(missing("Select a shipping option", "$.fulfillment.methods[0].groups[0].selected_option_id"));
     }
+    const blocked = messages.some((m) => m.type === "error") || pricing.lines.length === 0;
     messages.push(...state.paymentMessages);
-
-    const blocked = messages.some((m) => m.type === "error" && m.code !== "payment_declined") || pricing.lines.length === 0;
     const status: UcpStatus = state.sticky ?? (blocked ? "incomplete" : "ready_for_complete");
     const lineIds = pricing.lines.map((l) => `li_${l.product.id}`);
 

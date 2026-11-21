@@ -2,7 +2,7 @@ import { config } from "../config.ts";
 import type { Json, Req, Res, Router } from "../http.ts";
 import { sessionTotal } from "../acp.ts";
 import type { CheckoutSession, Item, LineItem, Message, Quote } from "../acp.ts";
-import { makePayment } from "./adyen-checkout.ts";
+import { isOutcomeUnknown, makePayment } from "./adyen-checkout.ts";
 import { RISK_LIMIT } from "./store.ts";
 import type { MerchantStore, Pricing } from "./store.ts";
 
@@ -10,6 +10,8 @@ interface Approval {
   total: number;
   currency: string;
   items: Item[];
+  pending?: { orderId: string; body: Record<string, unknown> };
+  inFlight?: boolean;
 }
 
 export function registerAcpHooks(router: Router, store: MerchantStore): void {
@@ -21,13 +23,17 @@ export function registerAcpHooks(router: Router, store: MerchantStore): void {
 }
 
 function unauthorised(req: Req): Res | undefined {
-  if (req.headers.authorization === `Bearer ${config.merchantHookSecret}`) return undefined;
+  if (config.merchantHookSecret && req.headers.authorization === `Bearer ${config.merchantHookSecret}`) return undefined;
   return { status: 401, body: { type: "invalid_request", code: "unauthorized", message: "merchant hook secret required" } };
 }
 
 export function quote(store: MerchantStore, body: Json): Quote {
   const items: Item[] = body.items ?? [];
   const pricing = store.price(body.currency, items, body.fulfillment_address, body.fulfillment_option_id);
+  const repeated = items.findIndex((it, i) => items.findIndex((other) => other.id === it.id) !== i);
+  if (repeated >= 0) {
+    pricing.problems.push({ code: "invalid_item", content: `${items[repeated].id} is listed twice; merge the quantities`, lineIndex: repeated });
+  }
   return toQuote(pricing, items);
 }
 
@@ -69,6 +75,9 @@ function commit(store: MerchantStore, approvals: Map<string, Approval>, req: Req
     return { status: 400, body: { type: "invalid_request", code: "invalid_session", message: "body.session must be the session in the path" } };
   }
   const previous = approvals.get(session.id);
+  if (previous?.pending) {
+    return { status: 200, body: { approved: false, messages: [error("payment_pending", "A payment for this session is pending; finalize it again")] } };
+  }
   if (previous) {
     store.release(previous.items);
     approvals.delete(session.id);
@@ -100,31 +109,46 @@ async function finalize(store: MerchantStore, approvals: Map<string, Approval>, 
   if (!approval) {
     return { status: 409, body: { result_code: "Error", refusal_reason: "no approved commit for this session" } };
   }
-  approvals.delete(sessionId);
+  if (approval.inFlight) {
+    return { status: 409, body: { result_code: "Error", refusal_reason: "a payment for this session is in flight" } };
+  }
   const payment: Json = req.body?.payment ?? {};
-  const orderId = store.newOrderId();
+  let orderId: string;
   let pspReference: string | undefined;
   let resultCode: string;
   let refusalReason: string | undefined;
 
   if (config.merchantFlow === "advanced") {
-    const result = await makePayment(
-      {
-        amount: { value: approval.total, currency: approval.currency },
-        reference: orderId,
-        shopperReference: sessionId,
-        paymentMethod: { type: "scheme", storedPaymentMethodId: payment.token },
-        shopperInteraction: "ContAuth",
-        recurringProcessingModel: "UnscheduledCardOnFile",
-        metadata: { agentProtocol: "ACP", agentSessionId: sessionId },
-      },
-      `${sessionId}-${payment.token}`,
-    );
+    if (!approval.pending) {
+      const id = store.newOrderId();
+      approval.pending = {
+        orderId: id,
+        body: {
+          amount: { value: approval.total, currency: approval.currency },
+          reference: id,
+          shopperReference: sessionId,
+          paymentMethod: { type: "scheme", storedPaymentMethodId: payment.token },
+          shopperInteraction: "ContAuth",
+          recurringProcessingModel: "UnscheduledCardOnFile",
+          metadata: { agentProtocol: "ACP", agentSessionId: sessionId },
+        },
+      };
+    }
+    const attempt = approval.pending;
+    orderId = attempt.orderId;
+    approval.inFlight = true;
+    const result = await makePayment(attempt.body, `${sessionId}-${attempt.orderId}`);
+    approval.inFlight = false;
+    if (isOutcomeUnknown(result.resultCode)) {
+      return { status: 200, body: { result_code: "Pending", refusal_reason: result.refusalReason } };
+    }
     ({ pspReference, resultCode, refusalReason } = result);
   } else {
+    orderId = store.newOrderId();
     pspReference = payment.psp_reference;
     resultCode = payment.result_code;
   }
+  approvals.delete(sessionId);
 
   if (resultCode !== "Authorised" || !pspReference) {
     store.release(approval.items);

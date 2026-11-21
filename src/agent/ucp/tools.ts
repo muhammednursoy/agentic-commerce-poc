@@ -1,5 +1,5 @@
 import { formatAmount } from "../../acp.ts";
-import type { UcpCheckout } from "../../ucp.ts";
+import type { PaymentInstrument, UcpCheckout } from "../../ucp.ts";
 import { describeForApproval } from "../shopper.ts";
 import { itemsInput, itemsSchema, sessionIdSchema, stringInput, toolError } from "../toolset.ts";
 import type { CheckoutSummary, Confirm, ToolDefinition, Toolset } from "../toolset.ts";
@@ -7,6 +7,8 @@ import { GooglePaySheet } from "./google-pay.ts";
 import type { UcpPlatform } from "./platform.ts";
 
 const checkoutId = { ...sessionIdSchema, description: "Checkout id returned by create_checkout, e.g. chk_..." };
+
+type Approved = { total: number; currency: string };
 
 const DEFINITIONS: ToolDefinition[] = [
   {
@@ -65,6 +67,7 @@ export class UcpToolset implements Toolset {
   readonly system: string;
   private readonly platform: UcpPlatform;
   private readonly sheet: GooglePaySheet;
+  private readonly pending = new Map<string, { instrument: PaymentInstrument; approved: Approved }>();
 
   constructor(platform: UcpPlatform, confirm: Confirm) {
     this.platform = platform;
@@ -82,6 +85,7 @@ export class UcpToolset implements Toolset {
       "Flow: list_products, create_checkout, select a shipping option with update_checkout (standard unless the shopper asked for faster delivery), then pay_with_google_pay.",
       "Messages with severity recoverable can be fixed with update_checkout (for example remove an out-of-stock item after telling the shopper). If the status is requires_escalation, give the shopper the continue_url and stop.",
       "If the payment is declined, tell the shopper and ask before trying again. pay_with_google_pay asks the shopper for approval itself; never ask for card details.",
+      "If a pay result has status complete_in_progress (message payment_pending) the payment may already have been taken: tell the shopper it is pending, call pay_with_google_pay again on the same checkout to re-check, and never create a new checkout for the same items.",
       `Saved shipping address: ${a.name}, ${a.line_one}, ${a.city} ${a.state} ${a.postal_code}, ${a.country}.`,
       "Reply in the shopper's language and keep replies short.",
     ].join("\n");
@@ -125,6 +129,11 @@ export class UcpToolset implements Toolset {
   private async pay(checkoutId: string): Promise<unknown> {
     const checkout = await this.platform.get(checkoutId);
     const summary = summarizeUcp(checkout);
+    if (checkout.status === "complete_in_progress") {
+      const entry = this.pending.get(checkoutId);
+      if (!entry) return { error: "payment is pending at the merchant", checkout: summary };
+      return this.complete(checkoutId, entry.instrument, entry.approved);
+    }
     if (!summary.ready) return { error: `checkout is ${checkout.status}, not ready_for_complete`, checkout: summary };
     const handler = (await this.platform.discover()).googlePay;
     if (!handler) return { error: "merchant does not accept Google Pay" };
@@ -141,7 +150,13 @@ export class UcpToolset implements Toolset {
     if (latest.totals.total !== approved.total || latest.currency !== approved.currency) {
       return { error: `the checkout total changed after the shopper approved ${formatAmount(approved.total, approved.currency)}; nothing was charged`, checkout: latest };
     }
+    return this.complete(checkoutId, instrument, approved);
+  }
+
+  private async complete(checkoutId: string, instrument: PaymentInstrument, approved: Approved): Promise<unknown> {
+    this.pending.set(checkoutId, { instrument, approved });
     const done = summarizeUcp(await this.platform.complete(checkoutId, instrument));
+    if (done.status !== "complete_in_progress") this.pending.delete(checkoutId);
     if (done.totals.total !== approved.total || done.currency !== approved.currency) {
       return { ...done, error: `the merchant completed for ${formatAmount(done.totals.total, done.currency)} but the shopper approved ${formatAmount(approved.total, approved.currency)}` };
     }
