@@ -4,7 +4,7 @@ import { callJson } from "../../http.ts";
 import type { CallResult } from "../../http.ts";
 import { GOOGLE_PAY_HANDLER, SHOPPING_SERVICE } from "../../ucp.ts";
 import type { GooglePayHandler, PaymentInstrument, PostalAddress, UcpCheckout, UcpLineItemInput, UcpProfile } from "../../ucp.ts";
-import type { Product } from "../../merchant/server.ts";
+import type { Product } from "../../domain.ts";
 import { defaultShopper } from "../shopper.ts";
 import type { ShopperProfile } from "../shopper.ts";
 

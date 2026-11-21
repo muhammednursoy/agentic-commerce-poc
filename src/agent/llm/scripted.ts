@@ -1,6 +1,5 @@
-import { formatAmount } from "../../acp.ts";
-import type { Item } from "../../acp.ts";
-import type { Product } from "../../merchant/server.ts";
+import { formatAmount } from "../../domain.ts";
+import type { Item, Product } from "../../domain.ts";
 import type { CheckoutSummary } from "../toolset.ts";
 import type { AgentOptions, ChatAgent } from "./types.ts";
 
@@ -38,6 +37,9 @@ export class ScriptedAgent implements ChatAgent {
     if (done.declined_by_shopper) return "Okay, I did not place the order.";
     if (done.error) return `Payment step failed: ${done.error}`;
     if (done.status === "requires_escalation") return `The merchant needs you to finish on their site: ${done.continue_url}`;
+    if (done.status === "complete_in_progress" || done.status === "in_progress") {
+      return `The payment for ${done.id} is pending and may already have been taken. Do not order again; the merchant will confirm it.`;
+    }
     if (done.status !== "completed" || !done.order) return `The order was not completed: ${done.messages.map((m) => m.content).join("; ")}`;
     return `Order ${done.order.id} placed for ${formatAmount(done.totals.total, done.currency)}. Details: ${done.order.permalink_url}`;
   }

@@ -1,15 +1,18 @@
 import { config } from "../config.ts";
 import type { Json, Req, Res, Router } from "../http.ts";
 import { sessionTotal } from "../acp.ts";
-import type { CheckoutSession, Item, LineItem, Message, Quote } from "../acp.ts";
+import type { CheckoutSession, LineItem, Message, Quote, Total } from "../acp.ts";
+import type { Item } from "../domain.ts";
 import { isOutcomeUnknown, makePayment } from "./adyen-checkout.ts";
+import type { PaymentResult } from "./adyen-checkout.ts";
 import { RISK_LIMIT } from "./store.ts";
-import type { MerchantStore, Pricing } from "./store.ts";
+import type { Consent, MerchantStore, Pricing } from "./store.ts";
 
 interface Approval {
   total: number;
   currency: string;
   items: Item[];
+  consent: Consent;
   pending?: { orderId: string; body: Record<string, unknown> };
   inFlight?: boolean;
 }
@@ -99,7 +102,22 @@ function commit(store: MerchantStore, approvals: Map<string, Approval>, req: Req
   const items = fresh.line_items.map((li) => ({ id: li.item.id, quantity: li.item.quantity }));
   const shortage = store.reserve(items);
   if (shortage) return { status: 200, body: { approved: false, messages: [error("product_out_of_stock", shortage)] } };
-  approvals.set(session.id, { total: sessionTotal(fresh), currency: session.currency, items });
+  const amountOf = (type: Total["type"]) => fresh.totals.find((t) => t.type === type)?.amount ?? 0;
+  const consent: Consent = {
+    protocol: "acp",
+    checkoutId: session.id,
+    approvedAt: new Date().toISOString(),
+    currency: session.currency,
+    lineItems: fresh.line_items.map((li) => ({ id: li.item.id, title: li.title, quantity: li.item.quantity, subtotal: li.subtotal })),
+    subtotal: amountOf("subtotal"),
+    shipping: amountOf("fulfillment"),
+    tax: amountOf("tax"),
+    total: sessionTotal(fresh),
+    ...(session.fulfillment_address ? { shippingAddress: session.fulfillment_address } : {}),
+    buyerEmail: session.buyer?.email,
+    paymentLabel: config.merchantFlow === "advanced" ? "card, ACP delegated token (merchant authorises)" : "card, ACP delegated token (Adyen authorises)",
+  };
+  approvals.set(session.id, { total: sessionTotal(fresh), currency: session.currency, items, consent });
   return { status: 200, body: { approved: true } };
 }
 
@@ -137,8 +155,12 @@ async function finalize(store: MerchantStore, approvals: Map<string, Approval>, 
     const attempt = approval.pending;
     orderId = attempt.orderId;
     approval.inFlight = true;
-    const result = await makePayment(attempt.body, `${sessionId}-${attempt.orderId}`);
-    approval.inFlight = false;
+    let result: PaymentResult;
+    try {
+      result = await makePayment(attempt.body, `${sessionId}-${attempt.orderId}`);
+    } finally {
+      approval.inFlight = false;
+    }
     if (isOutcomeUnknown(result.resultCode)) {
       return { status: 200, body: { result_code: "Pending", refusal_reason: result.refusalReason } };
     }
@@ -162,6 +184,7 @@ async function finalize(store: MerchantStore, approvals: Map<string, Approval>, 
     amount: approval.total,
     currency: approval.currency,
     items: approval.items,
+    consent: approval.consent,
   });
   return {
     status: 200,

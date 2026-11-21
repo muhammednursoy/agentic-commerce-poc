@@ -1,13 +1,25 @@
 import { randomId } from "../http.ts";
-import type { Item } from "../acp.ts";
+import type { Address, Item, Product } from "../domain.ts";
 
-export interface Product {
-  id: string;
-  title: string;
-  description: string;
-  price: number;
+export interface Consent {
+  protocol: "acp" | "ucp";
+  checkoutId: string;
+  approvedAt: string;
   currency: string;
-  stock: number;
+  lineItems: { id: string; title: string; quantity: number; subtotal: number }[];
+  subtotal: number;
+  shipping: number;
+  tax: number;
+  total: number;
+  shippingAddress?: Address;
+  buyerEmail?: string;
+  paymentLabel: string;
+}
+
+export interface Refund {
+  pspReference: string;
+  amount: number;
+  status: "received" | "refunded" | "failed";
 }
 
 export interface MerchantOrder {
@@ -18,8 +30,10 @@ export interface MerchantOrder {
   amount: number;
   currency: string;
   items: Item[];
+  consent: Consent;
   createdAt: string;
   webhookEvents: string[];
+  refund?: Refund;
 }
 
 export type ProblemCode =
@@ -155,7 +169,7 @@ export class MerchantStore {
     }
   }
 
-  recordOrder(order: Omit<MerchantOrder, "createdAt" | "webhookEvents">): MerchantOrder {
+  recordOrder(order: Omit<MerchantOrder, "createdAt" | "webhookEvents" | "refund">): MerchantOrder {
     this.release(order.items);
     for (const item of order.items) {
       const product = this.catalog.get(item.id);

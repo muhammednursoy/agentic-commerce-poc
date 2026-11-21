@@ -132,7 +132,7 @@ export function summarizeAcp(s: CheckoutSession): CheckoutSummary {
     status: s.status,
     ready: s.status === "ready_for_payment",
     currency: s.currency,
-    line_items: s.line_items.map((li) => ({ product_id: li.item.id, title: li.title, quantity: li.item.quantity, total: li.total })),
+    line_items: s.line_items.map((li) => ({ product_id: li.item.id, title: li.title, quantity: li.item.quantity, subtotal: li.subtotal, total: li.total })),
     fulfillment_options: s.fulfillment_options.map((o) => ({ id: o.id, title: o.title, subtitle: o.subtitle, total: o.total })),
     selected_fulfillment_option_id: s.fulfillment_option_id ?? null,
     totals: Object.fromEntries(s.totals.map((t) => [t.type, t.amount])),

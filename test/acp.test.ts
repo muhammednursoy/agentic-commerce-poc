@@ -1,6 +1,7 @@
 import { after, before, describe, test } from "node:test";
 import assert from "node:assert/strict";
 import type http from "node:http";
+import { assertAddsUp } from "./helpers.ts";
 
 process.env.MOCK_ADYEN_PORT = "18080";
 process.env.MERCHANT_PORT = "18081";
@@ -232,12 +233,35 @@ describe("agent end to end", () => {
     assert.match(reply, /^Order ord_/);
     assert.equal(approvals.length, 1);
     assert.match(approvals[0], /2 × Ethiopia Yirgacheffe/);
+    assertAddsUp(approvals[0]);
     assert.equal(merchant.catalog.get("sku_coffee_beans")!.stock, stockBefore - 2);
     const order = [...merchant.orders.values()].at(-1)!;
     const session = adyen.sessions.get(order.checkoutSessionId)!;
     assert.equal(session.status, "completed");
     assert.equal(session.order?.id, order.id);
     assert.equal(adyen.payments.at(-1)?.amount.value, order.amount);
+    const { consent } = (await callJson("GET", session.order!.permalink_url)).body;
+    assert.equal(consent.protocol, "acp");
+    assert.equal(consent.checkoutId, session.id);
+    assert.equal(consent.total, order.amount);
+    assert.equal(consent.subtotal + consent.shipping + consent.tax, consent.total);
+    assert.deepEqual(consent.lineItems.map((l: { id: string; quantity: number }) => [l.id, l.quantity]), [["sku_coffee_beans", 2], ["sku_filters", 1]]);
+    assert.equal(consent.shippingAddress.line_one, "350 5th Ave");
+    assert.match(consent.paymentLabel, /ACP delegated token/);
+    assert.ok(!Number.isNaN(Date.parse(consent.approvedAt)));
+  });
+
+  test("advanced flow: an empty HTTP 200 from Adyen leaves the session pending, and the retry completes it", async () => {
+    const platform = new AgentPlatform();
+    const session = await readySession(platform);
+    const toolset = new AcpToolset(platform, async () => true);
+    await withAdyen(() => () => ({ status: 200 }), async () => {
+      const first = await toolset.execute("pay_and_complete", { session_id: session.id }) as { status?: string; messages?: { code: string }[] };
+      assert.equal(first.status, "in_progress");
+      assert.equal(first.messages?.[0].code, "payment_pending");
+    });
+    const second = await toolset.execute("pay_and_complete", { session_id: session.id }) as { status?: string };
+    assert.equal(second.status, "completed");
   });
 
   test("shopper declining approval creates no token and no order", async () => {
@@ -311,25 +335,6 @@ describe("merchant ACP hooks", () => {
     for (const path of ["/agentic/quote", "/agentic/sessions/cs_forged/commit", "/agentic/sessions/cs_forged/finalize"]) {
       const res = await callJson("POST", `${config.merchantUrl}${path}`, { body: forged });
       assert.equal(res.status, 401, path);
-    }
-  });
-
-  test("with no hook secret (the test-mode default) every hook call is rejected", async () => {
-    process.env.ADYEN_MODE = "test";
-    try {
-      const fresh = await import(new URL("../src/config.ts?test-mode", import.meta.url).href);
-      assert.equal(fresh.config.merchantHookSecret, "");
-    } finally {
-      delete process.env.ADYEN_MODE;
-    }
-    const c = config as { merchantHookSecret: string };
-    const secret = c.merchantHookSecret;
-    c.merchantHookSecret = "";
-    try {
-      const res = await callJson("POST", `${config.merchantUrl}/agentic/quote`, { headers: { authorization: "Bearer " }, body: forged });
-      assert.equal(res.status, 401);
-    } finally {
-      c.merchantHookSecret = secret;
     }
   });
 

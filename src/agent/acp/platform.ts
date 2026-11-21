@@ -3,8 +3,8 @@ import { config } from "../../config.ts";
 import { callJson } from "../../http.ts";
 import type { CallResult } from "../../http.ts";
 import { sessionTotal } from "../../acp.ts";
-import type { CheckoutSession, Item } from "../../acp.ts";
-import type { Product } from "../../merchant/server.ts";
+import type { CheckoutSession } from "../../acp.ts";
+import type { Item, Product } from "../../domain.ts";
 import { defaultShopper } from "../shopper.ts";
 import type { ShopperProfile } from "../shopper.ts";
 

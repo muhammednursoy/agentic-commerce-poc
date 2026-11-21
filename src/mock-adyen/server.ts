@@ -44,6 +44,7 @@ export class MockAdyen {
   readonly sessions = new Map<string, CheckoutSession>();
   readonly tokens = new Map<string, TokenRecord>();
   readonly payments: Payment[] = [];
+  readonly refunds: { paymentPspReference: string; pspReference: string; amount: { value: number; currency: string } }[] = [];
   private readonly requestedItems = new Map<string, Json>();
   private readonly pendingFinalize = new Set<string>();
   private readonly idempotency = new Map<string, { hash: string; res: Res }>();
@@ -62,7 +63,8 @@ export class MockAdyen {
         "/paltokenization/servlet/Recurring/Agentic/acp/v1/agentic_commerce/delegate_payment",
         (r) => this.delegatePayment(r),
       )
-      .on("POST", "/v72/payments", (r) => this.checkoutPayments(r));
+      .on("POST", "/v72/payments", (r) => this.checkoutPayments(r))
+      .on("POST", "/v72/payments/:psp/refunds", (r) => this.refundPayment(r));
   }
 
   listen(port: number): Promise<http.Server> {
@@ -321,11 +323,55 @@ export class MockAdyen {
   }
 
   private checkoutPayments(req: Req): Res {
+    return this.checkoutCall(req, "payments", (body) => {
+      const res = body.paymentMethod?.type === "googlepay" ? this.authoriseGooglePay(body) : this.authorise(body);
+      const p = res.body;
+      if (p.pspReference && p.resultCode !== "RedirectShopper") {
+        this.notify({
+          amount: p.amount,
+          eventCode: "AUTHORISATION",
+          merchantAccountCode: body.merchantAccount,
+          merchantReference: p.merchantReference,
+          pspReference: p.pspReference,
+          reason: p.refusalReason ?? "",
+          success: p.resultCode === "Authorised" ? "true" : "false",
+          additionalData: { paymentMethod: p.paymentMethodType ?? "visa" },
+        });
+      }
+      return res;
+    });
+  }
+
+  private refundPayment(req: Req): Res {
+    return this.checkoutCall(req, "refunds", (body) => {
+      const payment = this.payments.find((p) => p.pspReference === req.params.psp && p.resultCode === "Authorised");
+      const amount = body.amount ?? {};
+      if (!payment) return { status: 422, body: { status: 422, errorCode: "167", message: "Original pspReference required for this operation", errorType: "validation" } };
+      const refunded = this.refunds.filter((r) => r.paymentPspReference === payment.pspReference).reduce((s, r) => s + r.amount.value, 0);
+      if (amount.currency !== payment.amount.currency || !Number.isInteger(amount.value) || amount.value <= 0 || refunded + amount.value > payment.amount.value) {
+        return { status: 422, body: { status: 422, errorCode: "137", message: "Invalid amount specified", errorType: "validation" } };
+      }
+      const refund = { merchantAccount: body.merchantAccount, paymentPspReference: payment.pspReference, pspReference: pspReference(), reference: body.reference, status: "received", amount };
+      this.refunds.push(refund);
+      this.notify({
+        amount,
+        eventCode: "REFUND",
+        merchantAccountCode: body.merchantAccount,
+        merchantReference: body.reference ?? payment.merchantReference,
+        originalReference: payment.pspReference,
+        pspReference: refund.pspReference,
+        success: "true",
+      });
+      return { status: 201, body: refund };
+    });
+  }
+
+  private checkoutCall(req: Req, operation: string, run: (body: Json) => Res): Res {
     if (req.headers["x-api-key"] !== config.checkoutApiKey) {
       return { status: 401, body: { status: 401, errorCode: "000", message: "HTTP Status Response - Unauthorized", errorType: "security" } };
     }
     const key = req.headers["idempotency-key"];
-    const scope = typeof key === "string" ? `payments ${key}` : undefined;
+    const scope = typeof key === "string" ? `${operation} ${key}` : undefined;
     const hash = createHash("sha256").update(JSON.stringify(req.body ?? {})).digest("hex");
     const seen = scope ? this.idempotency.get(scope) : undefined;
     if (seen) {
@@ -333,10 +379,8 @@ export class MockAdyen {
         ? seen.res
         : { status: 422, body: { status: 422, errorCode: "704", message: "request already processed or in progress", errorType: "validation" } };
     }
-    const body = req.body ?? {};
-    const res = body.paymentMethod?.type === "googlepay" ? this.authoriseGooglePay(body) : this.authorise(body);
+    const res = run(req.body ?? {});
     if (scope) this.idempotency.set(scope, { hash, res });
-    this.notify(body, res.body);
     return res;
   }
 
@@ -366,19 +410,8 @@ export class MockAdyen {
     return record("Authorised");
   }
 
-  private notify(request: Json, payment: Json): void {
-    if (!payment?.pspReference || payment.resultCode === "RedirectShopper") return;
-    const item: NotificationRequestItem = {
-      amount: payment.amount,
-      eventCode: "AUTHORISATION",
-      eventDate: new Date().toISOString(),
-      merchantAccountCode: request.merchantAccount,
-      merchantReference: payment.merchantReference,
-      pspReference: payment.pspReference,
-      reason: payment.refusalReason ?? "",
-      success: payment.resultCode === "Authorised" ? "true" : "false",
-      additionalData: { paymentMethod: payment.paymentMethodType ?? "visa" },
-    };
+  private notify(fields: Omit<NotificationRequestItem, "eventDate">): void {
+    const item: NotificationRequestItem = { ...fields, eventDate: new Date().toISOString(), additionalData: { ...fields.additionalData } };
     if (config.webhookHmacKey) item.additionalData!.hmacSignature = signNotification(item, config.webhookHmacKey);
     setTimeout(() => {
       callJson("POST", `${config.merchantUrl}/adyen/webhooks`, {

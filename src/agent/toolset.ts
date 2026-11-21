@@ -11,7 +11,7 @@ export interface CheckoutSummary {
   status: string;
   ready: boolean;
   currency: string;
-  line_items: { product_id: string; title: string; quantity: number; total: number }[];
+  line_items: { product_id: string; title: string; quantity: number; subtotal: number; total: number }[];
   fulfillment_options: { id: string; title: string; subtitle: string; total: number }[];
   selected_fulfillment_option_id: string | null;
   totals: Record<string, number>;

@@ -1,5 +1,5 @@
-import { formatAmount } from "../acp.ts";
-import type { Address, Buyer } from "../acp.ts";
+import { formatAmount } from "../domain.ts";
+import type { Address, Buyer } from "../domain.ts";
 import type { CheckoutSummary } from "./toolset.ts";
 
 export interface VaultedCard {
@@ -34,7 +34,7 @@ export function defaultShopper(): ShopperProfile {
 }
 
 export function describeForApproval(s: CheckoutSummary, paymentLabel: string): string {
-  const lines = s.line_items.map((li) => `  ${li.quantity} × ${li.title}  ${formatAmount(li.total, s.currency)}`);
+  const lines = s.line_items.map((li) => `  ${li.quantity} × ${li.title}  ${formatAmount(li.subtotal, s.currency)}`);
   const ship = s.fulfillment_options.find((o) => o.id === s.selected_fulfillment_option_id);
   return [
     ...lines,

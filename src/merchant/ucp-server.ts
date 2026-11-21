@@ -22,16 +22,16 @@ import type {
   UcpMessage,
   UcpProfile,
   UcpStatus,
+  UcpTotal,
 } from "../ucp.ts";
-import type { Item } from "../acp.ts";
+import type { Address, Item } from "../domain.ts";
 import { isOutcomeUnknown, makePayment } from "./adyen-checkout.ts";
 import type { PaymentResult } from "./adyen-checkout.ts";
 import { RISK_LIMIT } from "./store.ts";
-import type { MerchantStore, PriceProblem } from "./store.ts";
+import type { Consent, MerchantStore, PriceProblem } from "./store.ts";
 
 export const UCP_BASE_PATH = "/ucp/v1";
 const SESSION_TTL_MS = 6 * 60 * 60 * 1000;
-const STICKY: UcpStatus[] = ["completed", "canceled", "complete_in_progress", "requires_escalation"];
 const CHALLENGE_RESULTS = new Set(["RedirectShopper", "IdentifyShopper", "ChallengeShopper"]);
 
 interface SessionState {
@@ -43,10 +43,8 @@ interface SessionState {
   selectedOptionId?: string;
   expiresAt: number;
   sticky?: UcpStatus;
-  continueUrl?: string;
   escalation?: { reason: string; action?: Json };
   paymentMessages: UcpMessage[];
-  order?: { id: string; permalink_url: string };
   pending?: PendingPayment;
   snapshot?: UcpCheckout;
 }
@@ -57,6 +55,7 @@ interface PendingPayment {
   total: number;
   items: Item[];
   frozen: UcpCheckout;
+  consent: Consent;
   body: Record<string, unknown>;
   inFlight: boolean;
 }
@@ -184,7 +183,6 @@ export class UcpMerchant {
     state.paymentMessages = [];
     if (state.sticky === "requires_escalation") {
       state.sticky = undefined;
-      state.continueUrl = undefined;
       state.escalation = undefined;
     }
     applyBuyerAndFulfillment(state, body);
@@ -238,6 +236,20 @@ export class UcpMerchant {
       total,
       items,
       frozen,
+      consent: {
+        protocol: "ucp",
+        checkoutId: state.id,
+        approvedAt: new Date().toISOString(),
+        currency: state.currency,
+        lineItems: frozen.line_items.map((li) => ({ id: li.item.id, title: li.item.title, quantity: li.quantity, subtotal: amountOf(li.totals, "subtotal") })),
+        subtotal: amountOf(frozen.totals, "subtotal"),
+        shipping: amountOf(frozen.totals, "fulfillment"),
+        tax: amountOf(frozen.totals, "tax"),
+        total,
+        ...(state.destination ? { shippingAddress: toAddress(state.destination) } : {}),
+        buyerEmail: state.buyer?.email,
+        paymentLabel: `Google Pay ${instrument.display?.description ?? "card"}`,
+      },
       inFlight: false,
       body: {
         amount: { value: total, currency: state.currency },
@@ -253,15 +265,19 @@ export class UcpMerchant {
 
   private async charge(state: SessionState, pending: PendingPayment): Promise<Res> {
     pending.inFlight = true;
-    const result = await makePayment(pending.body, `${state.id}-${pending.orderId}`);
-    pending.inFlight = false;
+    let result: PaymentResult;
+    try {
+      result = await makePayment(pending.body, `${state.id}-${pending.orderId}`);
+    } finally {
+      pending.inFlight = false;
+    }
     if (state.pending === pending) this.settle(state, result);
     return { status: 200, body: this.view(state) };
   }
 
-  settleByReference(merchantReference: string, result: PaymentResult): boolean {
+  settleByReference(merchantReference: string, amount: { value: number; currency: string } | undefined, result: PaymentResult): boolean {
     const state = [...this.sessions.values()].find((s) => s.pending?.orderId === merchantReference);
-    if (!state) return false;
+    if (!state?.pending || amount?.value !== state.pending.total || amount.currency !== state.currency) return false;
     this.settle(state, result);
     return true;
   }
@@ -287,11 +303,11 @@ export class UcpMerchant {
         amount: pending.total,
         currency: state.currency,
         items: pending.items,
+        consent: pending.consent,
       });
       state.sticky = "completed";
-      state.order = { id: order.id, permalink_url: `${config.merchantUrl}/orders/${order.id}` };
       state.paymentMessages = [];
-      state.snapshot = { ...pending.frozen, status: "completed", messages: [], order: state.order };
+      state.snapshot = { ...pending.frozen, status: "completed", messages: [], order: { id: order.id, permalink_url: `${config.merchantUrl}/orders/${order.id}` } };
       return;
     }
     this.store.release(pending.items);
@@ -336,7 +352,6 @@ export class UcpMerchant {
 
   private escalate(state: SessionState, code: string, severity: Severity, content: string, action?: Json): UcpCheckout {
     state.sticky = "requires_escalation";
-    state.continueUrl = `${config.merchantUrl}/checkout/${state.id}`;
     state.escalation = { reason: code, action };
     state.paymentMessages = [{ type: "error", code, severity, content }];
     return this.view(state);
@@ -345,10 +360,7 @@ export class UcpMerchant {
   private load(id: string): SessionState | undefined {
     const state = this.sessions.get(id);
     const expirable = !state?.sticky || state.sticky === "requires_escalation";
-    if (state && expirable && state.expiresAt <= Date.now()) {
-      state.sticky = "canceled";
-      state.continueUrl = undefined;
-    }
+    if (state && expirable && state.expiresAt <= Date.now()) state.sticky = "canceled";
     return state;
   }
 
@@ -413,10 +425,26 @@ export class UcpMerchant {
         { type: "refund_policy", url: `${config.merchantUrl}/refunds` },
       ],
       expires_at: new Date(state.expiresAt).toISOString(),
-      ...(state.continueUrl && status === "requires_escalation" ? { continue_url: state.continueUrl } : {}),
-      ...(state.order ? { order: state.order } : {}),
+      ...(status === "requires_escalation" ? { continue_url: `${config.merchantUrl}/checkout/${state.id}` } : {}),
     };
   }
+}
+
+function amountOf(totals: UcpTotal[], type: UcpTotal["type"]): number {
+  return totals.find((t) => t.type === type)?.amount ?? 0;
+}
+
+function toAddress(d: PostalAddress): Address {
+  const name = [d.first_name, d.last_name].filter(Boolean).join(" ");
+  return {
+    ...(name ? { name } : {}),
+    line_one: d.street_address,
+    ...(d.extended_address ? { line_two: d.extended_address } : {}),
+    city: d.address_locality,
+    ...(d.address_region ? { state: d.address_region } : {}),
+    country: d.address_country,
+    postal_code: d.postal_code,
+  };
 }
 
 function envelope(): UcpEnvelope {

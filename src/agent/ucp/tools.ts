@@ -1,4 +1,4 @@
-import { formatAmount } from "../../acp.ts";
+import { formatAmount } from "../../domain.ts";
 import type { PaymentInstrument, UcpCheckout } from "../../ucp.ts";
 import { describeForApproval } from "../shopper.ts";
 import { itemsInput, itemsSchema, sessionIdSchema, stringInput, toolError } from "../toolset.ts";
@@ -129,10 +129,14 @@ export class UcpToolset implements Toolset {
   private async pay(checkoutId: string): Promise<unknown> {
     const checkout = await this.platform.get(checkoutId);
     const summary = summarizeUcp(checkout);
+    const entry = this.pending.get(checkoutId);
     if (checkout.status === "complete_in_progress") {
-      const entry = this.pending.get(checkoutId);
       if (!entry) return { error: "payment is pending at the merchant", checkout: summary };
       return this.complete(checkoutId, entry.instrument, entry.approved);
+    }
+    if (checkout.status === "completed" && entry) {
+      this.pending.delete(checkoutId);
+      return matchApproved(summary, entry.approved);
     }
     if (!summary.ready) return { error: `checkout is ${checkout.status}, not ready_for_complete`, checkout: summary };
     const handler = (await this.platform.discover()).googlePay;
@@ -157,11 +161,13 @@ export class UcpToolset implements Toolset {
     this.pending.set(checkoutId, { instrument, approved });
     const done = summarizeUcp(await this.platform.complete(checkoutId, instrument));
     if (done.status !== "complete_in_progress") this.pending.delete(checkoutId);
-    if (done.totals.total !== approved.total || done.currency !== approved.currency) {
-      return { ...done, error: `the merchant completed for ${formatAmount(done.totals.total, done.currency)} but the shopper approved ${formatAmount(approved.total, approved.currency)}` };
-    }
-    return done;
+    return matchApproved(done, approved);
   }
+}
+
+function matchApproved(done: CheckoutSummary, approved: Approved): CheckoutSummary & { error?: string } {
+  if (done.totals.total === approved.total && done.currency === approved.currency) return done;
+  return { ...done, error: `the merchant completed for ${formatAmount(done.totals.total, done.currency)} but the shopper approved ${formatAmount(approved.total, approved.currency)}` };
 }
 
 export function summarizeUcp(c: UcpCheckout): CheckoutSummary {
@@ -175,6 +181,7 @@ export function summarizeUcp(c: UcpCheckout): CheckoutSummary {
       product_id: li.item.id,
       title: li.item.title,
       quantity: li.quantity,
+      subtotal: li.totals.find((t) => t.type === "subtotal")?.amount ?? 0,
       total: li.totals.find((t) => t.type === "total")?.amount ?? 0,
     })),
     fulfillment_options: (group?.options ?? []).map((o) => ({ id: o.id, title: o.title, subtitle: o.description, total: o.totals.find((t) => t.type === "total")?.amount ?? 0 })),
