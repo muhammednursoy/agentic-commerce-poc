@@ -11,6 +11,8 @@ import { requestRefund } from "./adyen-checkout.ts";
 import { refundPaymentIntent } from "./stripe-payments.ts";
 import { MerchantStore } from "./store.ts";
 import { UcpMerchant } from "./ucp-server.ts";
+import { MerchantIntents } from "./verifiable-intent.ts";
+import { JWKS_PATH } from "../vi/credentials.ts";
 
 const TERMS = "Brew & Co terms of sale (POC). Orders placed by an AI agent on your behalf are binding once you approve the total in Google Pay or your agent platform.";
 const REFUNDS = "Brew & Co refund policy (POC). Unopened items can be returned within 30 days for a full refund to the original payment method.";
@@ -21,10 +23,13 @@ export class Merchant {
   readonly acp: AcpMerchant;
   readonly webhooks: NotificationRequestItem[] = [];
 
-  constructor(products?: Product[]) {
+  readonly intents: MerchantIntents;
+
+  constructor(products?: Product[], intents: MerchantIntents = new MerchantIntents()) {
     this.store = new MerchantStore(products);
+    this.intents = intents;
     this.ucp = new UcpMerchant(this.store);
-    this.acp = new AcpMerchant(this.store);
+    this.acp = new AcpMerchant(this.store, intents);
   }
 
   get catalog() {
@@ -38,6 +43,7 @@ export class Merchant {
   router(): Router {
     const router = new Router()
       .on("GET", "/products", () => ({ status: 200, body: { products: [...this.store.catalog.values()] } }))
+      .on("GET", JWKS_PATH, () => ({ status: 200, body: this.intents.jwks() }))
       .on("GET", "/orders/:id", (r) => {
         const order = this.store.orders.get(r.params.id);
         return order ? { status: 200, body: order } : { status: 404, body: { message: "order not found" } };

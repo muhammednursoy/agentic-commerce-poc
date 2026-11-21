@@ -86,11 +86,14 @@ const SENSITIVE = /("(number|cvc|cryptogram|googlePayToken|token|storedPaymentMe
 
 const SHARED_PAYMENT_TOKEN = /\bspt_[A-Za-z0-9]+/g;
 
+const COMPACT_JWT = /\beyJ[\w-]+\.[\w-]+\.[\w-]+(?:~[\w-]*)*/g;
+
 export function redact(text: string): string {
   return text
     .replace(SENSITIVE, (_, open: string, key: string, value: string, close: string) =>
       key === "number" ? `${open}${"*".repeat(Math.max(0, value.length - 4))}${value.slice(-4)}${close}` : `${open}***${close}`)
-    .replace(SHARED_PAYMENT_TOKEN, "spt_***");
+    .replace(SHARED_PAYMENT_TOKEN, "spt_***")
+    .replace(COMPACT_JWT, (jwt) => `${jwt.slice(0, 12)}…(${jwt.length} chars)`);
 }
 
 export async function callJson(
@@ -102,7 +105,7 @@ export async function callJson(
   const payload = options.form ? new URLSearchParams(options.form).toString() : json;
   if (tracing()) {
     const shown = options.form ? JSON.stringify(options.form) : json;
-    console.log(`  \x1b[2m${options.label ?? "http"} →${method} ${url}${shown ? `\n    ${redact(shown)}` : ""}\x1b[0m`);
+    console.log(`  \x1b[2m${options.label ?? "http"} →${method} ${redact(url)}${shown ? `\n    ${redact(shown)}` : ""}\x1b[0m`);
   }
   const response = await fetch(url, {
     method,

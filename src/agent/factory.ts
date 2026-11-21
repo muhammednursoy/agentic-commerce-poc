@@ -1,4 +1,5 @@
 import { config } from "../config.ts";
+import { AgentPaymentPlatform } from "../platform/platform.ts";
 import { AgentPlatform, merchantHostedAcp } from "./acp/platform.ts";
 import { defaultShopper } from "./shopper.ts";
 import { AcpToolset } from "./acp/tools.ts";
@@ -15,7 +16,7 @@ export function createToolset(confirm: Confirm, protocol: "acp" | "ucp" | "strip
     case "acp":
       return new AcpToolset(new AgentPlatform(), confirm);
     case "stripe":
-      return new AcpToolset(new AgentPlatform(defaultShopper(), merchantHostedAcp()), confirm);
+      return new AcpToolset(new AgentPlatform(defaultShopper(), merchantHostedAcp(), new AgentPaymentPlatform()), confirm);
     default:
       return new UcpToolset(new UcpPlatform(), confirm);
   }

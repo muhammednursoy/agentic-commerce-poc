@@ -49,6 +49,21 @@ export async function chargeSharedPaymentToken(charge: SharedTokenCharge, idempo
   }
 }
 
+export interface GrantedTokenView {
+  id: string;
+  shared_metadata?: Record<string, string>;
+  usage_limits?: { currency: string; max_amount: number; expires_at: number };
+}
+
+export async function retrieveSharedPaymentToken(id: string): Promise<GrantedTokenView | undefined> {
+  try {
+    const res = await stripeCall("GET", `/v1/shared_payment/granted_tokens/${encodeURIComponent(id)}`, { label: "merchant→stripe" });
+    return res.status === 200 && typeof res.body?.id === "string" ? res.body : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export interface StripeRefund {
   id?: string;
   status?: "succeeded" | "pending" | "failed" | "canceled" | "requires_action";

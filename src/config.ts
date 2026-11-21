@@ -20,6 +20,8 @@ const stripeKey = env.STRIPE_SECRET_KEY || "";
 if (stripeKey.startsWith("sk_live_")) throw new Error("STRIPE_SECRET_KEY is a live key; live Shared Payment Tokens must come from a real agent platform, so this POC refuses to start");
 if (stripeKey && !stripeKey.startsWith("sk_test_")) throw new Error("STRIPE_SECRET_KEY must be a secret test key (sk_test_...)");
 const stripeMode = stripeKey ? "test" : "mock";
+export const MOCK_MASTERCARD_PORT = Number(env.MOCK_MASTERCARD_PORT || 8084);
+const merchantUrl = env.MERCHANT_URL || `http://localhost:${MERCHANT_PORT}`;
 
 export const config = {
   mode,
@@ -43,7 +45,7 @@ export const config = {
   agenticToken: env.ADYEN_AGENTIC_TOKEN || mockOnly("mock_agentic_token"),
   checkoutApiKey: env.ADYEN_CHECKOUT_API_KEY || "mock_checkout_key",
   delegatePaymentApiVersion: "2025-09-29",
-  merchantUrl: env.MERCHANT_URL || `http://localhost:${MERCHANT_PORT}`,
+  merchantUrl,
   merchantFlow: oneOf("MERCHANT_FLOW", ["advanced", "standard"]),
   merchantHookSecret: env.MERCHANT_HOOK_SECRET || mockOnly("mock_merchant_hook_secret"),
   webhookHmacKey: env.ADYEN_HMAC_KEY || mockOnly("44782DEF547AAA06C910C43932B1EB0C71FC68D9D0C057550C48EC2ACF6BA056"),
@@ -58,6 +60,11 @@ export const config = {
     apiBase: env.STRIPE_API_BASE || (stripeMode === "test" ? "https://api.stripe.com" : `http://localhost:${MOCK_STRIPE_PORT}`),
     apiVersion: "2026-09-30.preview",
     timeoutMs: Number(env.STRIPE_TIMEOUT_MS || 15_000),
+  },
+  vi: {
+    mastercardUrl: env.MASTERCARD_URL || `http://localhost:${MOCK_MASTERCARD_PORT}`,
+    agentPlatformId: env.AGENT_PLATFORM_ID || "https://agent-platform.example",
+    merchant: { id: env.MERCHANT_ID || "brew-and-co", name: "Brew & Co", website: merchantUrl },
   },
 } as const;
 

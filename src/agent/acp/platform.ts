@@ -3,11 +3,11 @@ import { config } from "../../config.ts";
 import { callJson } from "../../http.ts";
 import type { CallResult } from "../../http.ts";
 import { sessionTotal } from "../../acp.ts";
-import { stripeCall } from "../../stripe-api.ts";
-import type { CheckoutSession } from "../../acp.ts";
+import type { CheckoutSession, PaymentData } from "../../acp.ts";
 import type { Item, Product } from "../../domain.ts";
 import { defaultShopper } from "../shopper.ts";
 import type { ShopperProfile } from "../shopper.ts";
+import type { Confirm, PaymentAuthority } from "../toolset.ts";
 
 export class AcpApiError extends Error {
   readonly status: number;
@@ -40,40 +40,34 @@ export function merchantHostedAcp(): AcpEndpoint {
   return { provider: "stripe", sessionsUrl: `${config.merchantUrl}/acp/checkout_sessions`, apiKey: config.merchantAcpApiKey, label: "agent→merchant acp" };
 }
 
-export interface SharedTokenLimits {
-  paymentMethod: string;
-  currency: string;
-  maxAmount: number;
-  expiresAt: number;
-}
+export class AdyenDelegatedCard implements PaymentAuthority {
+  readonly provider = "adyen";
+  private readonly platform: AgentPlatform;
 
-export async function grantSharedPaymentToken(limits: SharedTokenLimits): Promise<string> {
-  const res = await stripeCall("POST", "/v1/test_helpers/shared_payment/granted_tokens", {
-    label: "agent platform→stripe test helper",
-    form: {
-      payment_method: limits.paymentMethod,
-      "usage_limits[currency]": limits.currency.toLowerCase(),
-      "usage_limits[max_amount]": String(limits.maxAmount),
-      "usage_limits[expires_at]": String(limits.expiresAt),
-    },
-  });
-  if (res.status !== 200 || typeof res.body?.id !== "string") throw new AcpApiError("grant_shared_payment_token", res);
-  return res.body.id;
+  constructor(platform: AgentPlatform) {
+    this.platform = platform;
+  }
+
+  paymentLabel(): string {
+    return `card •••• ${this.platform.shopper.card.number.slice(-4)}`;
+  }
+
+  async authorize(session: CheckoutSession, summary: string, confirm: Confirm): Promise<PaymentData | undefined> {
+    if (!(await confirm(summary))) return undefined;
+    return { provider: "adyen", token: await this.platform.delegatePayment(session) };
+  }
 }
 
 export class AgentPlatform {
   readonly shopper: ShopperProfile;
   readonly endpoint: AcpEndpoint;
+  readonly payer: PaymentAuthority;
 
-  constructor(shopper: ShopperProfile = defaultShopper(), endpoint: AcpEndpoint = adyenCommerceSuite()) {
+  constructor(shopper: ShopperProfile = defaultShopper(), endpoint: AcpEndpoint = adyenCommerceSuite(), payer?: PaymentAuthority) {
     this.shopper = shopper;
     this.endpoint = endpoint;
-  }
-
-  paymentLabel(): string {
-    return this.endpoint.provider === "stripe"
-      ? `card via Stripe, test PaymentMethod ${this.shopper.stripePaymentMethod}`
-      : `card •••• ${this.shopper.card.number.slice(-4)}`;
+    if (!payer && endpoint.provider !== "adyen") throw new Error(`a ${endpoint.provider} checkout needs a payment authority (the agent platform)`);
+    this.payer = payer ?? new AdyenDelegatedCard(this);
   }
 
   async listProducts(): Promise<Product[]> {
@@ -102,24 +96,16 @@ export class AgentPlatform {
     return this.commerce("POST", `/${id}/cancel`, "cancel_checkout_session");
   }
 
-  completeSession(id: string, token: string): Promise<CheckoutSession> {
+  completeSession(id: string, payment: PaymentData | string): Promise<CheckoutSession> {
+    const paymentData = typeof payment === "string" ? { provider: this.endpoint.provider, token: payment } : payment;
     return this.commerce("POST", `/${id}/complete`, "complete_checkout_session", {
-      payment_data: { provider: this.endpoint.provider, token },
+      payment_data: paymentData,
       buyer: this.shopper.buyer,
-    }, { "idempotency-key": `complete-${id}-${createHash("sha256").update(token).digest("hex").slice(0, 16)}` });
+    }, { "idempotency-key": `complete-${id}-${createHash("sha256").update(JSON.stringify(paymentData)).digest("hex").slice(0, 16)}` });
   }
 
-  delegatePayment(session: CheckoutSession, ttlMinutes = 15): Promise<string> {
-    if (this.endpoint.provider !== "stripe") return this.delegateToAdyen(session, ttlMinutes);
-    return grantSharedPaymentToken({
-      paymentMethod: this.shopper.stripePaymentMethod,
-      currency: session.currency,
-      maxAmount: sessionTotal(session),
-      expiresAt: Math.floor(Date.now() / 1000) + ttlMinutes * 60,
-    });
-  }
-
-  private async delegateToAdyen(session: CheckoutSession, ttlMinutes: number): Promise<string> {
+  async delegatePayment(session: CheckoutSession, ttlMinutes = 15): Promise<string> {
+    if (this.endpoint.provider !== "adyen") throw new Error("delegate_payment is the Adyen ACP path; merchant-hosted checkouts are paid through the agent platform");
     const card = this.shopper.card;
     const address = this.shopper.address;
     const res = await callJson("POST", `${config.palBase}/agentic_commerce/delegate_payment`, {

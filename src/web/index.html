@@ -218,6 +218,9 @@ function handle(ev) {
       const html = `<h3 class="ok">✓ Sipariş verildi · ${esc(ev.order.id)}</h3>
         <div class="row"><span>Tahsil edilen</span><span>${money(ev.total, ev.currency)}</span></div>
         ${p.pspReference ? `<div class="row muted"><span>${esc(p.provider || "ödeme")} referansı</span><span><code>${esc(p.pspReference)}</code></span></div>` : ""}
+        ${p.verifiableIntent ? `<div class="row ok"><span>Mastercard Verifiable Intent ✓</span><span></span></div>
+          <div class="row muted"><span>checkout hash</span><span><code title="${esc(p.verifiableIntent.checkoutHash)}">${esc(p.verifiableIntent.checkoutHash.slice(0, 12))}…</code></span></div>
+          <div class="row muted"><span>intent id</span><span><code>${esc(p.verifiableIntent.intentId)}</code></span></div>` : ""}
         <div class="row">${p.dashboard ? `<a href="${esc(p.dashboard)}" target="_blank" rel="noopener">Stripe Dashboard'da gör ↗</a>` : "<span></span>"}<a href="${esc(ev.order.permalink_url)}" target="_blank" rel="noopener">Sipariş kaydı ↗</a></div>`;
       add(node("card", html));
       if ($("orders").classList.contains("empty")) { $("orders").className = ""; $("orders").innerHTML = ""; }

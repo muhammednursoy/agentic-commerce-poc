@@ -1,4 +1,4 @@
-import type { CheckoutSession } from "../../acp.ts";
+import type { CheckoutSession, PaymentData } from "../../acp.ts";
 import { describeForApproval } from "../shopper.ts";
 import { itemsInput, itemsSchema, sessionIdSchema, stringInput, toolError } from "../toolset.ts";
 import type { CheckoutSummary, Confirm, ToolDefinition, Toolset } from "../toolset.ts";
@@ -12,7 +12,7 @@ const PROVIDERS = {
   },
   stripe: {
     host: "directly with the merchant",
-    tokenize: "have the agent platform grant the merchant a Stripe Shared Payment Token (single use, limited to this amount and 15 minutes)",
+    tokenize: "have the agent platform verify the merchant-signed cart, sign a Mastercard Verifiable Intent for exactly that cart and grant the merchant a Stripe Shared Payment Token (single use, limited to this amount and 15 minutes)",
     role: "hosted by the merchant, with Stripe as the payment provider",
   },
 } as const;
@@ -69,7 +69,7 @@ export class AcpToolset implements Toolset {
   readonly system: string;
   private readonly platform: AgentPlatform;
   private readonly confirm: Confirm;
-  private readonly pending = new Map<string, string>();
+  private readonly pending = new Map<string, PaymentData>();
 
   constructor(platform: AgentPlatform, confirm: Confirm) {
     this.platform = platform;
@@ -123,18 +123,19 @@ export class AcpToolset implements Toolset {
     const session = await this.platform.getSession(sessionId);
     const summary = summarizeAcp(session);
     if (session.status === "in_progress") {
-      const token = this.pending.get(sessionId);
-      return token ? this.complete(sessionId, token) : { error: "payment is pending at the merchant", session: summary };
+      const payment = this.pending.get(sessionId);
+      return payment ? this.complete(sessionId, payment) : { error: "payment is pending at the merchant", session: summary };
     }
     if (!summary.ready) return { error: `session is ${session.status}, not ready_for_payment`, session: summary };
-    const approved = await this.confirm(describeForApproval(summary, this.platform.paymentLabel()));
-    if (!approved) return { declined_by_shopper: true, session_id: sessionId };
-    return this.complete(sessionId, await this.platform.delegatePayment(session));
+    const payer = this.platform.payer;
+    const payment = await payer.authorize(session, describeForApproval(summary, payer.paymentLabel()), this.confirm);
+    if (!payment) return { declined_by_shopper: true, session_id: sessionId };
+    return this.complete(sessionId, payment);
   }
 
-  private async complete(sessionId: string, token: string): Promise<CheckoutSummary> {
-    this.pending.set(sessionId, token);
-    const done = summarizeAcp(await this.platform.completeSession(sessionId, token));
+  private async complete(sessionId: string, payment: PaymentData): Promise<CheckoutSummary> {
+    this.pending.set(sessionId, payment);
+    const done = summarizeAcp(await this.platform.completeSession(sessionId, payment));
     if (done.status !== "in_progress") this.pending.delete(sessionId);
     return done;
   }

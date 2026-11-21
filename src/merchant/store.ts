@@ -32,6 +32,7 @@ export interface MerchantOrder {
   currency: string;
   items: Item[];
   consent: Consent;
+  verifiableIntent?: { checkoutHash: string; intentId: string };
   createdAt: string;
   webhookEvents: string[];
   refund?: Refund;

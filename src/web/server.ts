@@ -40,7 +40,7 @@ async function orderPayment(orderId: string) {
     const dashboard = order.provider === "stripe" && psp?.startsWith("pi_") && config.stripe.mode === "test"
       ? `https://dashboard.stripe.com/test/payments/${psp}`
       : undefined;
-    return { provider: order.provider, pspReference: psp, dashboard };
+    return { provider: order.provider, pspReference: psp, dashboard, verifiableIntent: order.verifiableIntent };
   } catch {
     return {};
   }
@@ -112,6 +112,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
 
   if (req.method === "GET" && url.pathname === "/api/events") {
     res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+    res.flushHeaders();
     for (const event of s.backlog) res.write(`data: ${JSON.stringify(event)}\n\n`);
     s.clients.add(res);
     req.on("close", () => s.clients.delete(res));

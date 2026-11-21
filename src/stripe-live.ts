@@ -1,5 +1,6 @@
-import { MERCHANT_PORT, config } from "./config.ts";
+import { MERCHANT_PORT, MOCK_MASTERCARD_PORT, config } from "./config.ts";
 import { Merchant } from "./merchant/server.ts";
+import { MockMastercard } from "./mock-mastercard/server.ts";
 import { createAgent, createToolset } from "./agent/factory.ts";
 import { dashboardPaymentUrl, stripeCall } from "./stripe-api.ts";
 
@@ -9,6 +10,7 @@ if (config.stripe.mode !== "test" || !config.stripe.apiBase.startsWith("https://
 
 const request = process.argv.slice(2).join(" ") || "Buy 2 bags of the coffee beans and a pack of paper filters";
 const shop = new Merchant();
+const network = await new MockMastercard().listen(MOCK_MASTERCARD_PORT);
 const server = await shop.listen(MERCHANT_PORT);
 try {
   const toolset = createToolset(async (summary) => {
@@ -16,7 +18,7 @@ try {
     return true;
   }, "stripe");
   const agent = createAgent({ toolset, onToolCall: (name, input) => console.log(`\n\x1b[36m⚙ ${name}\x1b[0m ${JSON.stringify(input)}`) }, "scripted");
-  console.log(`\nagent: ${agent.label} | protocol: acp (merchant-hosted) | stripe: test mode\nyou> ${request}`);
+  console.log(`\nagent: ${agent.label} | protocol: acp (merchant-hosted) | stripe: test mode | Verifiable Intent: mock Mastercard\nyou> ${request}`);
   const reply = await agent.send(request);
   console.log(`\n\x1b[32magent>\x1b[0m ${reply}`);
 
@@ -28,7 +30,12 @@ try {
   console.log(`PaymentIntent:  ${order.pspReference}`);
   console.log(`status:         ${intent.body?.status ?? `unknown (HTTP ${intent.status})`}`);
   console.log(`dashboard:      ${dashboardPaymentUrl(order.pspReference)}`);
-  if (intent.body?.status !== "succeeded") process.exitCode = 1;
+  console.log(`metadata:       ${JSON.stringify(intent.body?.metadata ?? {})}`);
+  const metadata = intent.body?.metadata ?? {};
+  const bound = metadata.vi_checkout_hash === order.verifiableIntent?.checkoutHash && metadata.vi_intent_id === order.verifiableIntent?.intentId && Boolean(metadata.vi_intent_id);
+  console.log(`Verifiable Intent: ${bound ? "checkout hash and intent id recorded on the PaymentIntent" : "MISSING on the PaymentIntent"}`);
+  if (intent.body?.status !== "succeeded" || !bound) process.exitCode = 1;
 } finally {
   server.close();
+  network.close();
 }

@@ -40,20 +40,27 @@ To chat instead, run `PROTOCOL=stripe npm run servers`, then `PROTOCOL=stripe np
 ```mermaid
 sequenceDiagram
     actor S as Shopper
-    participant A as Agent platform<br/>(scripted · Gemini · Claude)
+    participant A as Agent (LLM)<br/>scripted · Gemini · Claude
+    participant P as Agent platform<br/>src/platform (card, key, L1)
     participant M as Merchant backend<br/>ACP API (this repo)
+    participant N as Mastercard<br/>(MOCK issuer + VI service)
     participant T as Stripe<br/>(test mode)
     S->>A: "Buy 2 bags of coffee beans and filters"
     A->>M: POST /acp/checkout_sessions, then update with the shipping option
-    M-->>A: ready_for_payment, line items, totals
-    A->>S: Approve $76.73?
-    S-->>A: Approve
-    A->>T: test helper: grant SPT (max_amount = $76.73, expires in 15 min)
-    T-->>A: spt_...
-    A->>M: POST /acp/checkout_sessions/{id}/complete<br/>payment_data { provider: stripe, token: spt_... }
-    M->>T: POST /v1/payment_intents (amount, SPT, confirm, metadata, Idempotency-Key)
+    M-->>A: ready_for_payment, line items, totals, merchant-signed checkout_jwt
+    A->>P: pay_and_complete (session)
+    P->>M: GET /.well-known/jwks.json, verify checkout_jwt matches the session
+    P->>S: Approve $76.73? (the platform signs this exact cart)
+    S-->>P: Approve
+    P->>N: POST /verifiable-intent/registrations (L1 + L2, payment mandate disclosed)
+    N-->>P: intent_id
+    P->>T: test helper: grant SPT (max_amount = $76.73, 15 min, shared_metadata = checkout hash + intent id)
+    T-->>P: spt_...
+    P->>M: complete: payment_data { token: spt_..., verifiable_intent: { l1, l2, intent_id } }
+    M->>N: issuer JWKS, GET registration (verify L1 → L2 chain first)
+    M->>T: GET the SPT (shared_metadata must match), then POST /v1/payment_intents (metadata vi_checkout_hash, vi_intent_id)
     T-->>M: succeeded
-    M-->>A: completed + order (consent record stored)
+    M-->>A: completed + order (consent record + Verifiable Intent stored)
 ```
 
 | | Real | Simulated |
@@ -62,12 +69,13 @@ sequenceDiagram
 | PaymentIntents and refunds | yes, visible in the Stripe Dashboard (test mode) | |
 | Token limits: single use, `max_amount`, expiry | enforced by Stripe | |
 | The SPT grant | | `POST /v1/test_helpers/shared_payment/granted_tokens` with the seller's own test key, standing in for the agent platform. In production the agent platform (for example OpenAI) creates the token from the shopper's saved card; the seller never calls this |
-| The shopper's card | | Stripe test PaymentMethod `pm_card_visa` (`AGENT_STRIPE_PAYMENT_METHOD`) |
+| The shopper's card | | Stripe test PaymentMethod `pm_card_visa` (`AGENT_STRIPE_PAYMENT_METHOD`), held only by the agent platform module |
+| Mastercard Verifiable Intent issuer and registration service | | `src/mock-mastercard/server.ts` (port 8084), see the next section |
 | The agent and the approval screen | | scripted agent, auto-approved in `stripe:live`; in production the platform owns both |
 
 **Merchant ACP API** (bearer `MERCHANT_ACP_API_KEY`, default `mock_merchant_acp_key`): `POST /acp/checkout_sessions`, `GET|POST /acp/checkout_sessions/:id`, `POST /acp/checkout_sessions/:id/complete` (with `Idempotency-Key`), `POST /acp/checkout_sessions/:id/cancel`. Statuses: `not_ready_for_payment`, `ready_for_payment`, `in_progress`, `completed`, `canceled`. Pricing, stock, the risk limit and the consent record are the same code as the Adyen ACP hooks.
 
-**Outcomes of the PaymentIntent** (amount = the approved session total, `metadata` = `checkout_session_id`, `order_id`, `agent_protocol: ACP`, idempotency key `<session>-<order>`, fixed per payment attempt):
+**Outcomes of the PaymentIntent** (amount = the approved session total, `metadata` = `checkout_session_id`, `order_id`, `agent_protocol: ACP`, `vi_checkout_hash`, `vi_intent_id`, idempotency key `<session>-<order>`, fixed per payment attempt). Before any of these, a failed Verifiable Intent check answers `ready_for_payment` with an `intent_verification_failed` error message and charges nothing:
 
 - `succeeded` → `completed` with `order`. The order stores the `pi_...` and the consent record.
 - `requires_action` → back to `ready_for_payment` with a `requires_3ds` message. Nothing is charged; 3DS completion is not built.
@@ -77,7 +85,68 @@ sequenceDiagram
 
 **Refund:** `POST /orders/:id/refund` on a Stripe order calls `POST /v1/refunds` with `payment_intent`. A synchronous `succeeded` sets `order.refund.status` to `refunded` and answers 200.
 
-Checked live against the Stripe test API on 2026-11-21: grant, charge, reuse (400 "already in a deactivated state"), over-limit (400 "greater than the remaining amount capturable"), `pm_card_chargeDeclined` (402 `card_error` `card_declined`; the token stays active afterwards), `pm_card_authenticationRequired` (200 `requires_action`, `next_action.type: shared_payment_token_action`), refund. The local mock (`src/mock-stripe/server.ts`) reproduces these responses.
+Checked live against the Stripe test API on 2026-11-21: grant, charge, reuse (400 "already in a deactivated state"), over-limit (400 "greater than the remaining amount capturable"), `pm_card_chargeDeclined` (402 `card_error` `card_declined`; the token stays active afterwards), `pm_card_authenticationRequired` (200 `requires_action`, `next_action.type: shared_payment_token_action`), refund. Also checked live: the test helper accepts `shared_metadata[...]` on the grant, and the seller's `GET /v1/shared_payment/granted_tokens/{id}` returns it. The local mock (`src/mock-stripe/server.ts`) reproduces these responses.
+
+## Mastercard Verifiable Intent: the payment is bound to the cart the shopper approved
+
+**The problem.** A Shared Payment Token is not bound to a cart. Its only limits are `usage_limits` (currency, `max_amount`, `expires_at`), plus `agent_details`, `payment_method_details` and `shared_metadata`. An SPT granted for one cart was accepted by Stripe for an unrelated "gift card" PaymentIntent of a lower amount.
+
+**What this repo adds.** [Mastercard Verifiable Intent](https://verifiableintent.dev/spec/) (VI), **Immediate Purchase mode**, spec v0.1-draft (2026-02-18), checked against the reference implementation [agent-intent/verifiable-intent](https://github.com/agent-intent/verifiable-intent). VI is mandatory for `PROTOCOL=stripe`: a complete without a VI presentation gets 422. The shopper's key signs the exact merchant-signed cart. The merchant and the card network each verify that signature chain before money moves. The SPT stays the payment instrument.
+
+### The four roles
+
+| Role | Code | Holds | Does |
+|---|---|---|---|
+| **Agent platform** | `src/platform/platform.ts` | The card reference (`pm_card_visa`), the shopper's ES256 key pair, the shopper's L1 credential | Enrols the key with the issuer once and gets L1. On `pay_and_complete` it fetches the merchant JWKS, verifies the `checkout_jwt` and checks that it matches the session shown to the shopper. Then it asks for approval through the existing `confirm` callback (the CLI prompt or the web modal), signs L2, registers the intent with the network, grants the SPT with `max_amount` = the approved total and `shared_metadata` = `vi_checkout_hash` and `vi_intent_id`, and sends `payment_data { provider, token, verifiable_intent: { l1, l2, intent_id } }`. The toolset reaches it only through the `PaymentAuthority` interface (`paymentLabel`, `authorize`). The LLM never sees the key, the credentials, the JWTs, the SPT or the card (asserted in `test/stripe.test.ts`) |
+| **Merchant** | `src/merchant/verifiable-intent.ts`, `acp-server.ts` | Its own ES256 key; JWKS at `/.well-known/jwks.json` | Returns a merchant-signed `checkout_jwt` in every ACP session response, re-signed whenever the cart changes (and on GET when it is near expiry). Before charging, it verifies: L1 against the issuer JWKS (trusted issuers only); L2 against L1 `cnf.jwk`; `typ`; `sd_hash`; `exp`/`iat` with 300 s skew; lifetime ≤ 15 min; `aud`; the nonce has not been used here; every disclosure is committed in `_sd` and `delegate_payload`; no `cnf`/`constraints`; `checkout_hash` and `transaction_id` recompute. The disclosed `checkout_jwt` must be exactly the latest one it issued for this session, and its own signature must verify. `payment_amount` = `checkout_jwt` total = session total; `payee.id` = itself. The intent is registered at the network with the same hash, nonce, amount and payee. The SPT's `shared_metadata` names this intent. Only then does it charge, writing `vi_checkout_hash` and `vi_intent_id` into the PaymentIntent metadata and the order |
+| **Card network (MOCK)** | `src/mock-mastercard/server.ts`, port 8084 | Issuer signing key | Issuer role: JWKS at `/.well-known/jwks.json`; `POST /issuer/credentials` issues L1 for the platform's public key. MCS role: `POST /verifiable-intent/registrations` verifies the L1 → L2 chain, expiry and nonce uniqueness (409 on replay) and returns `intent_id`; `GET /verifiable-intent/registrations/:id` |
+| **PSP** | Stripe (real test mode, or `src/mock-stripe`) | The card | Enforces SPT limits and charges |
+
+Credentials, as built (claim names from the spec):
+
+- **L1** (`typ: sd+jwt`, issuer-signed): `iss`, `sub`, `iat`, `exp` (1 year), `vct: https://credentials.mastercard.com/card`, `cnf.jwk` (shopper public key), `pan_last_four`, `scheme`, `_sd_alg: sha-256`, `_sd` (the email is selectively disclosable).
+- **L2 Immediate** (`typ: kb-sd-jwt`, signed with the L1 `cnf.jwk` key): `nonce`, `aud`, `iat`, `exp` (15 min), `sd_hash` = B64U(SHA-256(serialized L1)), `delegate_payload` and `_sd` referencing two array-element disclosures. One is the checkout mandate `mandate.checkout.1` { `checkout_jwt`, `checkout_hash` }. The other is the payment mandate `mandate.payment.1` { `payment_instrument`, `payment_amount` {currency, amount in minor units}, `payee` {id, name, website}, `transaction_id` = `checkout_hash` }.
+- **`checkout_jwt`** (ES256, `typ: JWT`, merchant key): `iss` (merchant website), `sub` and `checkout_session_id`, `jti`, `iat`, `exp` (1 h), `merchant` {id, name, website}, `currency`, `line_items` [{sku, title, quantity, unit_price, subtotal, tax, total}], `fulfillment` {option_id, title, amount, address}, `subtotal`, `tax`, `total`.
+
+### What the tests show (`test/verifiable-intent.test.ts`, offline)
+
+All of these are rejected with `intent_verification_failed`, no PaymentIntent and no order:
+
+- the "gift card" attack: a valid presentation plus SPT for one cart, used on another session;
+- a presentation for a cart that was changed afterwards;
+- a tampered `checkout_jwt` with the price changed;
+- `payment_amount` ≠ total;
+- a foreign payee;
+- an L2 signed by a key that is not in L1;
+- an L1 from an unknown issuer, or with a forged issuer signature;
+- an expired L2;
+- a replayed nonce;
+- an intent unknown to the network.
+
+The platform refuses to sign or pay, and asks for no approval, when the merchant JWKS does not verify the `checkout_jwt` or when the signed cart differs from the session. The network refuses a wrong `aud`, a mismatched `sd_hash` and nonce replay.
+
+### What is simulated
+
+- **The issuer and the network are a local mock, not Mastercard.** The startup log says so. No Mastercard system was called. The issuer trusts whatever `pan_last_four` and `scheme` the platform declares at enrolment. The test card is a Stripe Visa test PaymentMethod, not a Mastercard.
+- **All keys are generated in memory at startup** (issuer, merchant, shopper device) and are lost on restart. There is no device binding, user authentication or passkey behind the shopper's key. Approval is the existing modal or the `--yes` flag.
+- **One Stripe account plays every role**: the platform grants the SPT with the seller's own test key through the test helper, as before.
+- The platform trusts the merchant JWKS at `MERCHANT_URL/.well-known/jwks.json`. There is no merchant directory.
+
+### What Stripe still does not enforce
+
+VI binds the payment to the cart **at this merchant's checkout and at the network**. Stripe itself knows nothing about VI: a PaymentIntent created directly with the SPT, outside this merchant's `complete` (for example by a compromised merchant backend), is not stopped by Stripe as long as it fits `usage_limits`. `shared_metadata` is informational and is checked only by this merchant. A real card network would enforce the registered intent at authorization time; this mock does not see the authorization.
+
+### Spec deviations and assumptions
+
+- `checkout_jwt` schema is implementation-defined in v0.1 (§6.3); ours is listed above and puts the line items and the total in it. It is merchant-signed, as §6.3 recommends.
+- The spec's presentation pattern (README §4.3) does not disclose the payment mandate to the merchant. Here the merchant gets the full L2 (both mandates) so it can require `payment_amount` = `checkout_jwt` total = session total. The network gets the payment mandate only.
+- L2 `aud` is the agent platform identifier (`AGENT_PLATFORM_ID`, default `https://agent-platform.example`), per the normative §4.3 table. The §11.1 example uses a network URL instead. Merchant and network accept only configured platform identifiers. The agent platform also acts as the wallet that holds the user key.
+- The nonce is generated by the platform. Merchant and network each reject a reused nonce (in-memory sets, lost on restart). There is no verifier-issued challenge.
+- `payment_instrument.type` is `stripe.payment_method` and `id` is the Stripe PaymentMethod id, instead of an SRC digital card. `payee.id` is required here (`MERCHANT_ID`, default `brew-and-co`), although the spec makes it optional.
+- One mandate pair per L2; multi-pair L2s and Autonomous mode (L3) are rejected.
+- The presentation is sent as `payment_data.verifiable_intent { l1, l2, intent_id }`, each serialized as `<jwt>~<disclosure>~…~`. This is an extension field on ACP `payment_data`, and `checkout_jwt` is an extension field on the ACP session.
+- The merchant also requires the SPT's `shared_metadata` (`vi_intent_id`, `vi_checkout_hash`) to match the presented intent. This is this POC's own binding, not part of VI.
+- Not implemented: L1 key rotation and revocation, and a status lifecycle for intents (the mock never marks an intent consumed).
 
 ## The purchase, step by step (Google UCP, mocked)
 
@@ -127,7 +196,7 @@ npm run stripe:live          # real provider: ACP + Stripe SPT against Stripe te
 npm run demo                 # UCP + Google Pay, scripted agent, auto-approved, full HTTP trace
 PROTOCOL=acp npm run demo    # same purchase over ACP via the Adyen mock
 PROTOCOL=stripe npm run demo # merchant-hosted ACP + Stripe (mock Stripe unless STRIPE_SECRET_KEY is set)
-npm test                     # 97 tests, all offline: contract, end to end, HMAC vectors, config, LLM loops, Stripe SPT
+npm test                     # 113 tests, all offline: contract, end to end, HMAC vectors, config, LLM loops, Stripe SPT, Verifiable Intent
 ```
 
 To chat with a real agent, start the servers with `npm run servers`. Then, in another terminal:
@@ -142,7 +211,7 @@ GEMINI_API_KEY=... npm run agent -- "2 paket kahve çekirdeği ve filtre kağıd
 | `claude` | paid API usage | `ANTHROPIC_API_KEY` |
 | `scripted` | free, no LLM | none; deterministic keyword matcher used by tests |
 
-`GEMINI_MODEL` / `CLAUDE_MODEL` override the model (Gemini default `gemini-3.6-flash`). Each Gemini request times out after 60 s with at most 3 attempts. If Google answers 503 "high demand" or a quota error, switch the model, for example `GEMINI_MODEL=gemini-3.5-flash-lite`. `ADYEN_MODE` (`mock` | `test`), `PROTOCOL` (`ucp` | `acp` | `stripe`) and `MERCHANT_FLOW` (`advanced` | `standard`) reject any other value at startup. `STRIPE_SECRET_KEY` must start with `sk_test_` (real Stripe test API) or be unset (local mock); a `sk_live_` key refuses to start, because live SPTs must come from a real agent platform. `STRIPE_API_BASE` overrides the Stripe host.
+`GEMINI_MODEL` / `CLAUDE_MODEL` override the model (Gemini default `gemini-3.6-flash`). Each Gemini request times out after 60 s with at most 3 attempts. If Google answers 503 "high demand" or a quota error, switch the model, for example `GEMINI_MODEL=gemini-3.5-flash-lite`. `ADYEN_MODE` (`mock` | `test`), `PROTOCOL` (`ucp` | `acp` | `stripe`) and `MERCHANT_FLOW` (`advanced` | `standard`) reject any other value at startup. `STRIPE_SECRET_KEY` must start with `sk_test_` (real Stripe test API) or be unset (local mock); a `sk_live_` key refuses to start, because live SPTs must come from a real agent platform. `STRIPE_API_BASE` overrides the Stripe host. With `PROTOCOL=stripe`, `npm run servers`, `npm run web` and `npm run stripe:live` also start the mock Mastercard on `MOCK_MASTERCARD_PORT` (default 8084; `MASTERCARD_URL` overrides its URL). `AGENT_PLATFORM_ID` and `MERCHANT_ID` set the L2 audience and the payee id.
 
 Stripe test PaymentMethods (set `AGENT_STRIPE_PAYMENT_METHOD`, real and mock): `pm_card_visa` succeeds, `pm_card_chargeDeclined` is declined, `pm_card_authenticationRequired` needs 3DS. Adyen mock test cards (set `AGENT_TEST_CARD`): `…1111` is authorised, `…0002` is refused for insufficient balance, and `…0044` triggers a 3-D Secure challenge (UCP: `requires_escalation`). Other things to try in chat: the out-of-stock gooseneck kettle, express shipping, changing quantities, closing the Google Pay sheet.
 
@@ -244,21 +313,25 @@ src/
   google-pay-mock.ts          mock Google Pay token format
   mock-adyen/server.ts        fake Checkout /payments + refunds, ACP Commerce Suite, PAL, webhooks
   mock-stripe/server.ts       fake SPT test helper, token retrieve, PaymentIntents, refunds
+  mock-mastercard/server.ts   SIMULATED Mastercard: VI issuer (L1, JWKS) and intent registration service
+  vi/                         Verifiable Intent: SD-JWT disclosures, L1/L2 issue and verify, checkout_jwt
+  platform/platform.ts        agent platform: card reference, shopper key, L1, approval, L2 signing, SPT grant
   merchant/
     store.ts                  catalog, pricing, tax, shipping, orders with consent and refund
     ucp-server.ts             /.well-known/ucp and UCP checkout sessions
     acp-hooks.ts              quote/commit/finalize hooks Adyen calls for ACP; shared ACP pricing and approval
     acp-server.ts             merchant-hosted ACP checkout API (/acp/checkout_sessions) for Stripe
     adyen-checkout.ts         /payments and refund client
-    stripe-payments.ts        PaymentIntent with an SPT, refund client
+    stripe-payments.ts        PaymentIntent with an SPT, SPT retrieve, refund client
+    verifiable-intent.ts      merchant key and JWKS, checkout_jwt signing, VI verification before the charge
     payment-outcome.ts        provider-neutral result codes and unknown-outcome classification
     server.ts                 routes, refunds, webhook receiver
   agent/
     ucp/                      UCP client, Google Pay sheet, tools
-    acp/                      ACP client (Adyen Commerce Suite or merchant-hosted), delegate_payment or SPT grant, tools
+    acp/                      ACP client (Adyen Commerce Suite or merchant-hosted), Adyen delegate_payment, tools (pay through PaymentAuthority)
     llm/                      Gemini, Claude, scripted agents
     cli.ts, factory.ts, shopper.ts, toolset.ts
-test/ucp.test.ts, acp.test.ts, stripe.test.ts, unit.test.ts, llm.test.ts, helpers.ts
+test/ucp.test.ts, acp.test.ts, stripe.test.ts, verifiable-intent.test.ts, unit.test.ts, llm.test.ts, helpers.ts
 ```
 
 All data is fake. Do not put real card numbers, real Google Pay tokens or Stripe keys in this repo; `.env` is git-ignored.

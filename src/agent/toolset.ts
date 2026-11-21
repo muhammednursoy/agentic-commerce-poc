@@ -1,3 +1,5 @@
+import type { CheckoutSession, PaymentData } from "../acp.ts";
+
 export interface ToolDefinition {
   name: string;
   description: string;
@@ -5,6 +7,12 @@ export interface ToolDefinition {
 }
 
 export type Confirm = (summary: string) => Promise<boolean>;
+
+export interface PaymentAuthority {
+  readonly provider: "adyen" | "stripe";
+  paymentLabel(): string;
+  authorize(session: CheckoutSession, summary: string, confirm: Confirm): Promise<PaymentData | undefined>;
+}
 
 export interface CheckoutSummary {
   id: string;

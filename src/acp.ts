@@ -1,4 +1,5 @@
 import type { Address, Buyer, Item } from "./domain.ts";
+import type { VerifiablePresentation } from "./vi/credentials.ts";
 
 export type SessionStatus = "not_ready_for_payment" | "ready_for_payment" | "in_progress" | "completed" | "canceled";
 
@@ -57,6 +58,13 @@ export interface CheckoutSession {
   messages: Message[];
   links: { type: string; url: string }[];
   order?: Order;
+  checkout_jwt?: string;
+}
+
+export interface PaymentData {
+  provider: "adyen" | "stripe";
+  token: string;
+  verifiable_intent?: VerifiablePresentation;
 }
 
 export interface Quote {

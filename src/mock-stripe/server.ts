@@ -11,6 +11,7 @@ interface GrantedToken {
   livemode: false;
   payment_method: string;
   usage_limits: { currency: string; max_amount: number; expires_at: number };
+  shared_metadata: Record<string, string>;
   deactivated_at: number | null;
 }
 
@@ -97,6 +98,7 @@ export class MockStripe {
       livemode: false,
       payment_method: paymentMethod,
       usage_limits: { currency, max_amount: maxAmount, expires_at: expiresAt },
+      shared_metadata: bracketed(body, "shared_metadata"),
       deactivated_at: null,
     };
     this.tokens.set(token.id, token);
@@ -136,10 +138,7 @@ export class MockStripe {
       amount,
       currency,
       status,
-      metadata: Object.fromEntries(Object.entries(body).flatMap(([k, v]) => {
-        const key = /^metadata\[(.+)\]$/.exec(k)?.[1];
-        return key ? [[key, String(v)]] : [];
-      })),
+      metadata: bracketed(body, "metadata"),
       shared_payment_granted_token: token.id,
       amount_refunded: 0,
     };
@@ -170,6 +169,13 @@ export class MockStripe {
     this.refunds.push(refund);
     return { status: 200, body: refund };
   }
+}
+
+function bracketed(body: Json, field: string): Record<string, string> {
+  return Object.fromEntries(Object.entries(body).flatMap(([k, v]) => {
+    const key = new RegExp(`^${field}\\[(.+)\\]$`).exec(k)?.[1];
+    return key ? [[key, String(v)]] : [];
+  }));
 }
 
 function now(): number {
