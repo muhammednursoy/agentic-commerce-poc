@@ -84,6 +84,7 @@ export function defaultCatalog(): Product[] {
 export class MerchantStore {
   readonly catalog: Map<string, Product>;
   readonly orders = new Map<string, MerchantOrder>();
+  private readonly reserved = new Map<string, number>();
 
   constructor(products: Product[] = defaultCatalog()) {
     this.catalog = new Map(products.map((p) => [p.id, { ...p }]));
@@ -134,7 +135,28 @@ export class MerchantStore {
     return randomId("ord_", 5);
   }
 
+  reserve(items: Item[]): string | undefined {
+    const wanted = new Map<string, number>();
+    for (const item of items) wanted.set(item.id, (wanted.get(item.id) ?? 0) + item.quantity);
+    for (const [id, quantity] of wanted) {
+      const product = this.catalog.get(id);
+      const free = (product?.stock ?? 0) - (this.reserved.get(id) ?? 0);
+      if (free < quantity) return `Only ${Math.max(0, free)} of ${product?.title ?? id} available`;
+    }
+    for (const [id, quantity] of wanted) this.reserved.set(id, (this.reserved.get(id) ?? 0) + quantity);
+    return undefined;
+  }
+
+  release(items: Item[]): void {
+    for (const item of items) {
+      const left = (this.reserved.get(item.id) ?? 0) - item.quantity;
+      if (left > 0) this.reserved.set(item.id, left);
+      else this.reserved.delete(item.id);
+    }
+  }
+
   recordOrder(order: Omit<MerchantOrder, "createdAt" | "webhookEvents">): MerchantOrder {
+    this.release(order.items);
     for (const item of order.items) {
       const product = this.catalog.get(item.id);
       if (product) product.stock -= item.quantity;

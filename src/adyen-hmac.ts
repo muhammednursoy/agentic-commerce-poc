@@ -19,8 +19,8 @@ function signingString(item: NotificationRequestItem): string {
     item.originalReference ?? "",
     item.merchantAccountCode,
     item.merchantReference,
-    item.amount.value,
-    item.amount.currency,
+    item.amount?.value ?? "",
+    item.amount?.currency ?? "",
     item.eventCode,
     item.success,
   ].join(":");

@@ -1,8 +1,7 @@
-import type { CheckoutSession, Item } from "../../acp.ts";
+import type { CheckoutSession } from "../../acp.ts";
 import { describeForApproval } from "../shopper.ts";
-import { itemsSchema, sessionIdSchema } from "../toolset.ts";
+import { itemsInput, itemsSchema, sessionIdSchema, stringInput, toolError } from "../toolset.ts";
 import type { CheckoutSummary, Confirm, ToolDefinition, Toolset } from "../toolset.ts";
-import { AdyenApiError } from "./platform.ts";
 import type { AgentPlatform } from "./platform.ts";
 
 const DEFINITIONS: ToolDefinition[] = [
@@ -77,8 +76,7 @@ export class AcpToolset implements Toolset {
     try {
       return await this.run(name, input ?? {});
     } catch (err) {
-      if (err instanceof AdyenApiError) return { error: err.message };
-      throw err;
+      return toolError(err);
     }
   }
 
@@ -88,18 +86,18 @@ export class AcpToolset implements Toolset {
       case "list_products":
         return { products: await p.listProducts() };
       case "create_checkout_session":
-        return summarizeAcp(await p.createSession(input.items as Item[]));
+        return summarizeAcp(await p.createSession(itemsInput(input.items)));
       case "update_checkout_session":
-        return summarizeAcp(await p.updateSession(input.session_id, {
-          ...(input.items ? { items: input.items } : {}),
+        return summarizeAcp(await p.updateSession(stringInput(input.session_id, "session_id"), {
+          ...(input.items !== undefined ? { items: itemsInput(input.items) } : {}),
           ...(input.fulfillment_option_id ? { fulfillment_option_id: input.fulfillment_option_id } : {}),
         }));
       case "get_checkout_session":
-        return summarizeAcp(await p.getSession(input.session_id));
+        return summarizeAcp(await p.getSession(stringInput(input.session_id, "session_id")));
       case "cancel_checkout_session":
-        return summarizeAcp(await p.cancelSession(input.session_id));
+        return summarizeAcp(await p.cancelSession(stringInput(input.session_id, "session_id")));
       case "pay_and_complete":
-        return this.payAndComplete(input.session_id);
+        return this.payAndComplete(stringInput(input.session_id, "session_id"));
       default:
         return { error: `unknown tool ${name}` };
     }

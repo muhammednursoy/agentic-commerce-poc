@@ -81,7 +81,7 @@ export interface CallResult {
   body: Json;
 }
 
-const SENSITIVE = /("(number|cvc|cryptogram)":\s*")([^"]+)(")/g;
+const SENSITIVE = /("(number|cvc|cryptogram|googlePayToken|token|exp_month|exp_year|name)":\s*")((?:[^"\\]|\\.)*)(")/g;
 
 export function redact(text: string): string {
   return text.replace(SENSITIVE, (_, open: string, key: string, value: string, close: string) =>
@@ -91,7 +91,7 @@ export function redact(text: string): string {
 export async function callJson(
   method: string,
   url: string,
-  options: { headers?: Record<string, string>; body?: Json; label?: string } = {},
+  options: { headers?: Record<string, string>; body?: Json; label?: string; signal?: AbortSignal } = {},
 ): Promise<CallResult> {
   const payload = options.body === undefined ? undefined : JSON.stringify(options.body);
   if (tracing()) {
@@ -101,11 +101,13 @@ export async function callJson(
     method,
     headers: { "content-type": "application/json", ...options.headers },
     body: payload,
+    signal: options.signal,
   });
   const text = await response.text();
   const body = response.headers.get("content-type")?.includes("json") && text ? JSON.parse(text) : text || undefined;
   if (tracing()) {
-    console.log(`  \x1b[2m${options.label ?? "http"} ←${response.status} ${text.length > 600 ? `${text.slice(0, 600)}…` : text}\x1b[0m`);
+    const shown = redact(text);
+    console.log(`  \x1b[2m${options.label ?? "http"} ←${response.status} ${shown.length > 600 ? `${shown.slice(0, 600)}…` : shown}\x1b[0m`);
   }
   return { status: response.status, body };
 }

@@ -36,6 +36,7 @@ interface Payment {
   action?: Json;
 }
 
+const HOOK_HEADERS = () => ({ authorization: `Bearer ${config.merchantHookSecret}` });
 const REFUSED_CARD_SUFFIX = "0002";
 const CHALLENGE_CARD_SUFFIX = "0044";
 
@@ -110,7 +111,7 @@ export class MockAdyen {
   private async updateSession(req: Req): Promise<Res> {
     const session = this.sessions.get(req.params.id);
     if (!session) return notFound();
-    if (session.status === "completed" || session.status === "canceled") {
+    if (session.status === "completed" || session.status === "canceled" || session.status === "in_progress") {
       return { status: 200, body: { ...session, messages: [error("invalid_state", `session is ${session.status}`)] } };
     }
     const body = req.body ?? {};
@@ -130,6 +131,7 @@ export class MockAdyen {
     this.requestedItems.set(session.id, items);
     const { body: quote } = await callJson("POST", `${config.merchantUrl}/agentic/quote`, {
       label: "adyen→merchant",
+      headers: HOOK_HEADERS(),
       body: {
         checkout_session_id: session.id,
         currency: session.currency,
@@ -171,6 +173,7 @@ export class MockAdyen {
     session.status = "in_progress";
     const commit = await callJson("POST", `${config.merchantUrl}/agentic/sessions/${session.id}/commit`, {
       label: "adyen→merchant",
+      headers: HOOK_HEADERS(),
       body: { session },
     });
     if (!commit.body?.approved) {
@@ -193,6 +196,7 @@ export class MockAdyen {
 
     const finalize = await callJson("POST", `${config.merchantUrl}/agentic/sessions/${session.id}/finalize`, {
       label: "adyen→merchant",
+      headers: HOOK_HEADERS(),
       body: flow === "standard"
         ? { flow, session, payment: { psp_reference: payment.pspReference, result_code: payment.resultCode } }
         : { flow, session, payment: { provider: "adyen", token: token.id } },
@@ -215,8 +219,8 @@ export class MockAdyen {
   private cancelSession(req: Req): Res {
     const session = this.sessions.get(req.params.id);
     if (!session) return notFound();
-    if (session.status === "completed") {
-      return { status: 200, body: { ...session, messages: [error("invalid_state", "completed sessions cannot be canceled")] } };
+    if (session.status === "completed" || session.status === "in_progress") {
+      return { status: 200, body: { ...session, messages: [error("invalid_state", `${session.status} sessions cannot be canceled`)] } };
     }
     session.status = "canceled";
     session.messages = [];

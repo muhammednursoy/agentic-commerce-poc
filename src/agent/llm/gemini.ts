@@ -11,7 +11,7 @@ export class GeminiAgent implements ChatAgent {
   private readonly options: AgentOptions;
   private readonly history: Content[] = [];
 
-  constructor(options: AgentOptions, apiKey: string, model = process.env.GEMINI_MODEL ?? DEFAULT_GEMINI_MODEL) {
+  constructor(options: AgentOptions, apiKey: string, model = process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL) {
     this.ai = new GoogleGenAI({ apiKey });
     this.model = model;
     this.options = options;
@@ -37,8 +37,10 @@ export class GeminiAgent implements ChatAgent {
           }],
         },
       });
-      const content = response.candidates?.[0]?.content;
-      if (content) this.history.push(content);
+      const candidate = response.candidates?.[0];
+      const content = candidate?.content;
+      if (!content?.parts?.length) return `(no reply from the model: ${candidate?.finishReason ?? "no candidate"})`;
+      this.history.push(content);
       const calls = response.functionCalls ?? [];
       if (calls.length === 0) return response.text ?? "";
 

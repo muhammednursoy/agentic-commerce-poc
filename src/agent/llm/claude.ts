@@ -1,4 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
+import { isToolError } from "../toolset.ts";
 import type { AgentOptions, ChatAgent } from "./types.ts";
 
 export const DEFAULT_CLAUDE_MODEL = "claude-opus-5-5";
@@ -13,7 +14,7 @@ export class ClaudeAgent implements ChatAgent {
   private readonly options: AgentOptions;
   private readonly messages: MessageParam[] = [];
 
-  constructor(options: AgentOptions, model = process.env.CLAUDE_MODEL ?? DEFAULT_CLAUDE_MODEL) {
+  constructor(options: AgentOptions, model = process.env.CLAUDE_MODEL || DEFAULT_CLAUDE_MODEL) {
     this.model = model;
     this.options = options;
     this.label = `claude (${model})`;
@@ -39,19 +40,24 @@ export class ClaudeAgent implements ChatAgent {
         betas: ["server-side-fallback-2026-07-01"],
         fallbacks: "default",
       });
-      this.messages.push({ role: "assistant", content: response.content });
-
       if (response.stop_reason === "refusal") return "(the model declined this request)";
+      this.messages.push({ role: "assistant", content: response.content });
       if (response.stop_reason === "pause_turn") continue;
       const text = response.content.flatMap((b) => (b.type === "text" ? [b.text] : [])).join("\n");
-      if (response.stop_reason !== "tool_use") return text;
+      if (response.stop_reason !== "tool_use") {
+        if (response.content.some((b) => b.type === "tool_use")) {
+          this.messages.pop();
+          return `(stopped: ${response.stop_reason} cut the reply inside a tool call)`;
+        }
+        return text;
+      }
 
       const results: ToolResult[] = [];
       for (const block of response.content) {
         if (block.type !== "tool_use") continue;
         this.options.onToolCall?.(block.name, block.input);
         const output = await toolset.execute(block.name, block.input as Record<string, unknown>);
-        results.push({ type: "tool_result", tool_use_id: block.id, content: JSON.stringify(output) });
+        results.push({ type: "tool_result", tool_use_id: block.id, content: JSON.stringify(output), is_error: isToolError(output) });
       }
       this.messages.push({ role: "user", content: results });
     }

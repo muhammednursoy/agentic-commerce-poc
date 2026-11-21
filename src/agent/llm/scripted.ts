@@ -16,18 +16,22 @@ export class ScriptedAgent implements ChatAgent {
 
   async send(userText: string): Promise<string> {
     const { names } = this.options.toolset;
-    const { products } = await this.call<{ products: Product[] }>(names.list, {});
-    const items = pickItems(userText, products);
+    const listed = await this.call<{ products: Product[]; error?: string }>(names.list, {});
+    if (listed.error) return `Could not read the product feed: ${listed.error}`;
+    const items = pickItems(userText, listed.products);
     if (items.length === 0) {
-      return `I could not match your request to a product. Available: ${products.map((p) => p.title).join(", ")}.`;
+      return `I could not match your request to a product. Available: ${listed.products.map((p) => p.title).join(", ")}.`;
     }
-    let checkout = await this.call<CheckoutSummary>(names.create, { items });
+    let checkout = await this.call<PayResult>(names.create, { items });
+    if (checkout.error) return `Could not create the checkout: ${checkout.error}`;
     const blocking = checkout.messages.filter((m) => m.type === "error" && m.code !== "missing" && m.code !== "missing_fulfillment_option");
     if (blocking.length) return `The merchant rejected the cart: ${blocking.map((m) => m.content).join("; ")}`;
 
     const cheapest = [...checkout.fulfillment_options].sort((a, b) => a.total - b.total)[0];
+    if (!cheapest) return `The merchant offered no shipping option: ${JSON.stringify(checkout.messages)}`;
     const idField = this.options.toolset.protocol === "ucp" ? "checkout_id" : "session_id";
-    checkout = await this.call<CheckoutSummary>(names.update, { [idField]: checkout.id, fulfillment_option_id: cheapest.id });
+    checkout = await this.call<PayResult>(names.update, { [idField]: checkout.id, fulfillment_option_id: cheapest.id });
+    if (checkout.error) return `Could not update the checkout: ${checkout.error}`;
     if (!checkout.ready) return `Checkout is ${checkout.status}: ${JSON.stringify(checkout.messages)}`;
 
     const done = await this.call<PayResult>(names.pay, { [idField]: checkout.id });

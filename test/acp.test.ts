@@ -251,6 +251,46 @@ describe("agent end to end", () => {
   });
 });
 
+describe("merchant ACP hooks", () => {
+  const forged = {
+    flow: "standard",
+    session: { id: "cs_forged", currency: "USD", totals: [{ type: "total", amount: 1 }], line_items: [{ item: { id: "sku_filters", quantity: 50 } }] },
+    payment: { psp_reference: "FORGED", result_code: "Authorised" },
+  };
+
+  test("hooks reject calls without the shared secret", async () => {
+    for (const path of ["/agentic/quote", "/agentic/sessions/cs_forged/commit", "/agentic/sessions/cs_forged/finalize"]) {
+      const res = await callJson("POST", `${config.merchantUrl}${path}`, { body: forged });
+      assert.equal(res.status, 401, path);
+    }
+  });
+
+  test("finalize without an approved commit creates no order and moves no stock", async () => {
+    const ordersBefore = merchant.orders.size;
+    const stockBefore = merchant.catalog.get("sku_filters")!.stock;
+    const res = await callJson("POST", `${config.merchantUrl}/agentic/sessions/cs_forged/finalize`, {
+      headers: { authorization: `Bearer ${config.merchantHookSecret}` },
+      body: forged,
+    });
+    assert.equal(res.status, 409);
+    assert.equal(merchant.orders.size, ordersBefore);
+    assert.equal(merchant.catalog.get("sku_filters")!.stock, stockBefore);
+  });
+
+  test("standard flow: Adyen authorises and the merchant records the approved amount", async () => {
+    const c = config as { merchantFlow: string };
+    c.merchantFlow = "standard";
+    try {
+      const reply = await new ScriptedAgent({ toolset: new AcpToolset(new AgentPlatform(), async () => true) }).send("one pour-over dripper");
+      assert.match(reply, /^Order ord_/);
+      const order = [...merchant.orders.values()].at(-1)!;
+      assert.equal(order.amount, adyen.payments.at(-1)?.amount.value);
+    } finally {
+      c.merchantFlow = "advanced";
+    }
+  });
+});
+
 test("pickItems reads quantities from free text", () => {
   const products = [...new Merchant().catalog.values()];
   assert.deepEqual(pickItems("Buy 2 bags of the coffee beans and paper filters", products), [

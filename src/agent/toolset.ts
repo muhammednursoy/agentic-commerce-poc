@@ -28,7 +28,27 @@ export interface Toolset {
   execute(name: string, input: Record<string, any>): Promise<unknown>;
 }
 
-export const sessionIdSchema = { type: "string", description: "Checkout session id returned by the create tool" };
+export function itemsInput(value: unknown): { id: string; quantity: number }[] {
+  const ok = Array.isArray(value) && value.length > 0
+    && value.every((i) => typeof i?.id === "string" && Number.isInteger(i?.quantity) && i.quantity >= 1);
+  if (!ok) throw new Error("items must be a non-empty array of { id: string, quantity: positive integer }");
+  return value;
+}
+
+export function stringInput(value: unknown, field: string): string {
+  if (typeof value !== "string" || !value) throw new Error(`${field} must be a non-empty string`);
+  return value;
+}
+
+export function toolError(err: unknown): { error: string } {
+  return { error: err instanceof Error ? err.message : String(err) };
+}
+
+export function isToolError(output: unknown): boolean {
+  return typeof output === "object" && output !== null && "error" in output;
+}
+
+export const sessionIdSchema ={ type: "string", description: "Checkout session id returned by the create tool" };
 
 export const itemsSchema = {
   type: "array",

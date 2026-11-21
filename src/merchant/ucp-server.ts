@@ -8,6 +8,7 @@ import {
   GOOGLE_PAY_HANDLER,
   SHOPPING_SERVICE,
   UCP_VERSION,
+  ucpTotal,
 } from "../ucp.ts";
 import type {
   GooglePayHandler,
@@ -22,7 +23,9 @@ import type {
   UcpProfile,
   UcpStatus,
 } from "../ucp.ts";
-import { makePayment } from "./adyen-checkout.ts";
+import type { Item } from "../acp.ts";
+import { UNKNOWN_OUTCOME, makePayment } from "./adyen-checkout.ts";
+import type { PaymentResult } from "./adyen-checkout.ts";
 import { RISK_LIMIT } from "./store.ts";
 import type { MerchantStore, PriceProblem } from "./store.ts";
 
@@ -44,6 +47,18 @@ interface SessionState {
   escalation?: { reason: string; action?: Json };
   paymentMessages: UcpMessage[];
   order?: { id: string; permalink_url: string };
+  pending?: PendingPayment;
+  snapshot?: UcpCheckout;
+}
+
+interface PendingPayment {
+  orderId: string;
+  tokenHash: string;
+  total: number;
+  items: Item[];
+  frozen: UcpCheckout;
+  body: Record<string, unknown>;
+  inFlight: boolean;
 }
 
 export function googlePayHandler(): GooglePayHandler {
@@ -82,6 +97,7 @@ export class UcpMerchant {
   readonly sessions = new Map<string, SessionState>();
   private readonly store: MerchantStore;
   private readonly idempotency = new Map<string, { hash: string; res: Res }>();
+  private readonly inflight = new Map<string, { hash: string; promise: Promise<Res> }>();
 
   constructor(store: MerchantStore) {
     this.store = store;
@@ -121,11 +137,20 @@ export class UcpMerchant {
     if (req.method === "GET" || typeof key !== "string") return next();
     const scope = `${req.method} ${req.path} ${key}`;
     const hash = createHash("sha256").update(JSON.stringify(req.body ?? {})).digest("hex");
-    const seen = this.idempotency.get(scope);
-    if (seen) return seen.hash === hash ? seen.res : fail(409, "idempotency_conflict", "Idempotency-Key reused with a different body");
-    const res = await next();
-    if (res.status < 500) this.idempotency.set(scope, { hash, res });
-    return res;
+    const seen = this.idempotency.get(scope) ?? this.inflight.get(scope);
+    if (seen) {
+      if (seen.hash !== hash) return fail(409, "idempotency_conflict", "Idempotency-Key reused with a different body");
+      return "res" in seen ? seen.res : seen.promise;
+    }
+    const promise = (async () => next())();
+    this.inflight.set(scope, { hash, promise });
+    try {
+      const res = await promise;
+      if (res.status < 500 && res.body?.status !== "complete_in_progress") this.idempotency.set(scope, { hash, res });
+      return res;
+    } finally {
+      this.inflight.delete(scope);
+    }
   }
 
   private create(req: Req): Res {
@@ -177,7 +202,8 @@ export class UcpMerchant {
     const state = this.load(req.params.id);
     if (!state) return fail(404, "not_found", "checkout session not found");
     const current = this.view(state);
-    if (current.status !== "ready_for_complete") {
+    const retry = current.status === "complete_in_progress";
+    if (!retry && current.status !== "ready_for_complete") {
       return fail(409, "invalid_state", `checkout is ${current.status}, not ready_for_complete`);
     }
     const handler = googlePayHandler();
@@ -190,17 +216,36 @@ export class UcpMerchant {
     if (instrument.credential?.type !== "PAYMENT_GATEWAY" || typeof instrument.credential.token !== "string" || !instrument.credential.token) {
       return fail(400, "invalid", "credential must be a PAYMENT_GATEWAY token", "$.payment.instruments[0].credential");
     }
+    const tokenHash = createHash("sha256").update(instrument.credential.token).digest("hex").slice(0, 16);
+    if (retry) {
+      const pending = state.pending;
+      if (!pending || pending.inFlight || pending.tokenHash !== tokenHash) {
+        return fail(409, "invalid_state", "checkout is complete_in_progress; only the same payment instrument can be retried");
+      }
+      return this.charge(state, pending);
+    }
     if (req.body.buyer) state.buyer = { ...state.buyer, ...req.body.buyer };
 
-    const total = current.totals.find((t) => t.type === "total")!.amount;
+    const frozen = this.view(state);
+    const total = ucpTotal(frozen);
     if (total > RISK_LIMIT) {
       return { status: 200, body: this.escalate(state, "high_value_order", "requires_buyer_review", "Order exceeds the merchant's automatic approval limit") };
     }
+    const items = state.lineItems.map((li) => ({ id: li.item.id, quantity: li.quantity }));
+    const shortage = this.store.reserve(items);
+    if (shortage) return fail(409, "out_of_stock", shortage, "$.line_items");
 
-    state.sticky = "complete_in_progress";
     const orderId = this.store.newOrderId();
-    const result = await makePayment(
-      {
+    state.sticky = "complete_in_progress";
+    state.paymentMessages = [];
+    state.pending = {
+      orderId,
+      tokenHash,
+      total,
+      items,
+      frozen,
+      inFlight: false,
+      body: {
         amount: { value: total, currency: state.currency },
         reference: orderId,
         paymentMethod: { type: "googlepay", googlePayToken: instrument.credential.token },
@@ -208,28 +253,59 @@ export class UcpMerchant {
         shopperEmail: state.buyer?.email,
         metadata: { agentProtocol: "UCP", agentSessionId: state.id, agentPlatform: "Google" },
       },
-      `${state.id}-${createHash("sha256").update(instrument.credential.token).digest("hex").slice(0, 16)}`,
-    );
+    };
+    return this.charge(state, state.pending);
+  }
 
+  private async charge(state: SessionState, pending: PendingPayment): Promise<Res> {
+    pending.inFlight = true;
+    const result = await makePayment(pending.body, `${state.id}-${pending.orderId}`);
+    pending.inFlight = false;
+    this.settle(state, result);
+    return { status: 200, body: this.view(state) };
+  }
+
+  settleByReference(merchantReference: string, result: PaymentResult): boolean {
+    const state = [...this.sessions.values()].find((s) => s.pending?.orderId === merchantReference);
+    if (!state) return false;
+    this.settle(state, result);
+    return true;
+  }
+
+  private settle(state: SessionState, result: PaymentResult): void {
+    const pending = state.pending;
+    if (state.sticky !== "complete_in_progress" || !pending) return;
+    if (result.resultCode === UNKNOWN_OUTCOME) {
+      state.paymentMessages = [{
+        type: "info",
+        code: "payment_pending",
+        content: "The payment outcome is not known yet. Retry complete with the same payment instrument, or get the checkout again later.",
+      }];
+      return;
+    }
+    state.pending = undefined;
     if (result.resultCode === "Authorised" && result.pspReference) {
       const order = this.store.recordOrder({
-        id: orderId,
+        id: pending.orderId,
         protocol: "ucp",
         checkoutSessionId: state.id,
         pspReference: result.pspReference,
-        amount: total,
+        amount: pending.total,
         currency: state.currency,
-        items: state.lineItems.map((li) => ({ id: li.item.id, quantity: li.quantity })),
+        items: pending.items,
       });
       state.sticky = "completed";
       state.order = { id: order.id, permalink_url: `${config.merchantUrl}/orders/${order.id}` };
-      return { status: 200, body: this.view(state) };
+      state.paymentMessages = [];
+      state.snapshot = { ...pending.frozen, status: "completed", messages: [], order: state.order };
+      return;
     }
-    if (CHALLENGE_RESULTS.has(result.resultCode)) {
-      state.sticky = undefined;
-      return { status: 200, body: this.escalate(state, "requires_3ds", "requires_buyer_input", "The card issuer requires 3-D Secure authentication", result.action) };
-    }
+    this.store.release(pending.items);
     state.sticky = undefined;
+    if (CHALLENGE_RESULTS.has(result.resultCode)) {
+      this.escalate(state, "requires_3ds", "requires_buyer_input", "The card issuer requires 3-D Secure authentication", result.action);
+      return;
+    }
     state.paymentMessages = [{
       type: "error",
       code: "payment_declined",
@@ -237,21 +313,22 @@ export class UcpMerchant {
       content: `Payment was not authorised: ${result.refusalReason ?? result.resultCode}. Try another card.`,
       path: "$.payment.instruments[0]",
     }];
-    return { status: 200, body: this.view(state) };
   }
 
   private cancel(req: Req): Res {
     const state = this.load(req.params.id);
     if (!state) return fail(404, "not_found", "checkout session not found");
-    if (state.sticky === "completed" || state.sticky === "canceled") {
-      return fail(409, "invalid_state", `checkout is already ${state.sticky}`);
+    if (state.sticky === "completed" || state.sticky === "canceled" || state.sticky === "complete_in_progress") {
+      return fail(409, "invalid_state", `checkout is ${state.sticky} and cannot be canceled`);
     }
     state.sticky = "canceled";
-    return { status: 200, body: this.view(state) };
+    state.paymentMessages = [];
+    state.snapshot = this.view(state);
+    return { status: 200, body: state.snapshot };
   }
 
   private continuePage(req: Req): Res {
-    const state = this.sessions.get(req.params.id);
+    const state = this.load(req.params.id);
     if (!state) return fail(404, "not_found", "checkout session not found");
     return { status: 200, body: { checkout_id: state.id, status: this.view(state).status, escalation: state.escalation ?? null } };
   }
@@ -266,11 +343,16 @@ export class UcpMerchant {
 
   private load(id: string): SessionState | undefined {
     const state = this.sessions.get(id);
-    if (state && !state.sticky && state.expiresAt <= Date.now()) state.sticky = "canceled";
+    const expirable = !state?.sticky || state.sticky === "requires_escalation";
+    if (state && expirable && state.expiresAt <= Date.now()) {
+      state.sticky = "canceled";
+      state.continueUrl = undefined;
+    }
     return state;
   }
 
   view(state: SessionState): UcpCheckout {
+    if (state.snapshot) return state.snapshot;
     const items = state.lineItems.map((li) => ({ id: li.item.id, quantity: li.quantity }));
     const destination = state.destination
       ? { country: state.destination.address_country, state: state.destination.address_region }
@@ -357,9 +439,12 @@ function applyBuyerAndFulfillment(state: SessionState, body: Json): void {
 
 function validateLineItems(items: Json): string | undefined {
   if (!Array.isArray(items) || items.length === 0) return "line_items must be a non-empty array";
+  const ids = new Set<string>();
   for (const [i, li] of items.entries()) {
     if (typeof li?.item?.id !== "string") return `line_items[${i}].item.id is required`;
     if (!Number.isInteger(li.quantity) || li.quantity < 1) return `line_items[${i}].quantity must be a positive integer`;
+    if (ids.has(li.item.id)) return `line_items[${i}].item.id ${li.item.id} is listed twice; merge the quantities`;
+    ids.add(li.item.id);
   }
   return undefined;
 }

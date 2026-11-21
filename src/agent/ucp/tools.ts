@@ -1,9 +1,9 @@
+import { formatAmount } from "../../acp.ts";
 import type { UcpCheckout } from "../../ucp.ts";
 import { describeForApproval } from "../shopper.ts";
-import { itemsSchema, sessionIdSchema } from "../toolset.ts";
+import { itemsInput, itemsSchema, sessionIdSchema, stringInput, toolError } from "../toolset.ts";
 import type { CheckoutSummary, Confirm, ToolDefinition, Toolset } from "../toolset.ts";
-import { GooglePaySheet, GooglePayUnavailable } from "./google-pay.ts";
-import { UcpError } from "./platform.ts";
+import { GooglePaySheet } from "./google-pay.ts";
 import type { UcpPlatform } from "./platform.ts";
 
 const checkoutId = { ...sessionIdSchema, description: "Checkout id returned by create_checkout, e.g. chk_..." };
@@ -91,8 +91,7 @@ export class UcpToolset implements Toolset {
     try {
       return await this.run(name, input ?? {});
     } catch (err) {
-      if (err instanceof UcpError || err instanceof GooglePayUnavailable) return { error: err.message };
-      throw err;
+      return toolError(err);
     }
   }
 
@@ -106,15 +105,18 @@ export class UcpToolset implements Toolset {
       case "list_products":
         return { products: await p.listProducts() };
       case "create_checkout":
-        return summarizeUcp(await p.create(input.items));
+        return summarizeUcp(await p.create(itemsInput(input.items)));
       case "update_checkout":
-        return summarizeUcp(await p.update(input.checkout_id, { items: input.items, fulfillmentOptionId: input.fulfillment_option_id }));
+        return summarizeUcp(await p.update(stringInput(input.checkout_id, "checkout_id"), {
+          items: input.items === undefined ? undefined : itemsInput(input.items),
+          fulfillmentOptionId: input.fulfillment_option_id,
+        }));
       case "get_checkout":
-        return summarizeUcp(await p.get(input.checkout_id));
+        return summarizeUcp(await p.get(stringInput(input.checkout_id, "checkout_id")));
       case "cancel_checkout":
-        return summarizeUcp(await p.cancel(input.checkout_id));
+        return summarizeUcp(await p.cancel(stringInput(input.checkout_id, "checkout_id")));
       case "pay_with_google_pay":
-        return this.pay(input.checkout_id);
+        return this.pay(stringInput(input.checkout_id, "checkout_id"));
       default:
         return { error: `unknown tool ${name}` };
     }
@@ -134,7 +136,16 @@ export class UcpToolset implements Toolset {
       describeForApproval(summary, `Google Pay ${card.brand.toUpperCase()} •••• ${card.number.slice(-4)}`),
     );
     if (!instrument) return { declined_by_shopper: true, checkout_id: checkoutId };
-    return summarizeUcp(await this.platform.complete(checkoutId, instrument));
+    const approved = { total: summary.totals.total, currency: summary.currency };
+    const latest = summarizeUcp(await this.platform.get(checkoutId));
+    if (latest.totals.total !== approved.total || latest.currency !== approved.currency) {
+      return { error: `the checkout total changed after the shopper approved ${formatAmount(approved.total, approved.currency)}; nothing was charged`, checkout: latest };
+    }
+    const done = summarizeUcp(await this.platform.complete(checkoutId, instrument));
+    if (done.totals.total !== approved.total || done.currency !== approved.currency) {
+      return { ...done, error: `the merchant completed for ${formatAmount(done.totals.total, done.currency)} but the shopper approved ${formatAmount(approved.total, approved.currency)}` };
+    }
+    return done;
   }
 }
 

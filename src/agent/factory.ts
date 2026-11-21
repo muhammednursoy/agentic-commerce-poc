@@ -14,7 +14,7 @@ export function createToolset(confirm: Confirm, protocol: "acp" | "ucp" = config
 }
 
 export function createAgent(options: AgentOptions, provider = process.env.LLM_PROVIDER): ChatAgent {
-  const geminiKey = process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY;
+  const geminiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
   const chosen = provider || (geminiKey ? "gemini" : process.env.ANTHROPIC_API_KEY ? "claude" : "scripted");
   switch (chosen) {
     case "gemini":

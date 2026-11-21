@@ -6,11 +6,23 @@ import { makePayment } from "./adyen-checkout.ts";
 import { RISK_LIMIT } from "./store.ts";
 import type { MerchantStore, Pricing } from "./store.ts";
 
+interface Approval {
+  total: number;
+  currency: string;
+  items: Item[];
+}
+
 export function registerAcpHooks(router: Router, store: MerchantStore): void {
+  const approvals = new Map<string, Approval>();
   router
-    .on("POST", "/agentic/quote", (r) => ({ status: 200, body: quote(store, r.body ?? {}) }))
-    .on("POST", "/agentic/sessions/:id/commit", (r) => commit(store, r))
-    .on("POST", "/agentic/sessions/:id/finalize", (r) => finalize(store, r));
+    .on("POST", "/agentic/quote", (r) => unauthorised(r) ?? { status: 200, body: quote(store, r.body ?? {}) })
+    .on("POST", "/agentic/sessions/:id/commit", (r) => unauthorised(r) ?? commit(store, approvals, r))
+    .on("POST", "/agentic/sessions/:id/finalize", (r) => unauthorised(r) ?? finalize(store, approvals, r));
+}
+
+function unauthorised(req: Req): Res | undefined {
+  if (req.headers.authorization === `Bearer ${config.merchantHookSecret}`) return undefined;
+  return { status: 401, body: { type: "invalid_request", code: "unauthorized", message: "merchant hook secret required" } };
 }
 
 export function quote(store: MerchantStore, body: Json): Quote {
@@ -51,8 +63,16 @@ function toQuote(p: Pricing, items: Item[]): Quote {
   };
 }
 
-function commit(store: MerchantStore, req: Req): Res {
-  const session: CheckoutSession = req.body.session;
+function commit(store: MerchantStore, approvals: Map<string, Approval>, req: Req): Res {
+  const session: CheckoutSession | undefined = req.body?.session;
+  if (!session || session.id !== req.params.id || !Array.isArray(session.line_items)) {
+    return { status: 400, body: { type: "invalid_request", code: "invalid_session", message: "body.session must be the session in the path" } };
+  }
+  const previous = approvals.get(session.id);
+  if (previous) {
+    store.release(previous.items);
+    approvals.delete(session.id);
+  }
   const fresh = quote(store, {
     currency: session.currency,
     items: session.line_items.map((li) => li.item),
@@ -67,29 +87,38 @@ function commit(store: MerchantStore, req: Req): Res {
   if (sessionTotal(session) > RISK_LIMIT) {
     return { status: 200, body: { approved: false, messages: [error("risk_rejected", "Order exceeds the merchant risk limit")] } };
   }
+  const items = fresh.line_items.map((li) => ({ id: li.item.id, quantity: li.item.quantity }));
+  const shortage = store.reserve(items);
+  if (shortage) return { status: 200, body: { approved: false, messages: [error("product_out_of_stock", shortage)] } };
+  approvals.set(session.id, { total: sessionTotal(fresh), currency: session.currency, items });
   return { status: 200, body: { approved: true } };
 }
 
-async function finalize(store: MerchantStore, req: Req): Promise<Res> {
-  const { flow, session, payment } = req.body as { flow: string; session: CheckoutSession; payment: Json };
-  const amount = sessionTotal(session);
+async function finalize(store: MerchantStore, approvals: Map<string, Approval>, req: Req): Promise<Res> {
+  const sessionId = req.params.id;
+  const approval = approvals.get(sessionId);
+  if (!approval) {
+    return { status: 409, body: { result_code: "Error", refusal_reason: "no approved commit for this session" } };
+  }
+  approvals.delete(sessionId);
+  const payment: Json = req.body?.payment ?? {};
   const orderId = store.newOrderId();
   let pspReference: string | undefined;
   let resultCode: string;
   let refusalReason: string | undefined;
 
-  if (flow === "advanced") {
+  if (config.merchantFlow === "advanced") {
     const result = await makePayment(
       {
-        amount: { value: amount, currency: session.currency },
+        amount: { value: approval.total, currency: approval.currency },
         reference: orderId,
-        shopperReference: session.id,
+        shopperReference: sessionId,
         paymentMethod: { type: "scheme", storedPaymentMethodId: payment.token },
         shopperInteraction: "ContAuth",
         recurringProcessingModel: "UnscheduledCardOnFile",
-        metadata: { agentProtocol: "ACP", agentSessionId: session.id },
+        metadata: { agentProtocol: "ACP", agentSessionId: sessionId },
       },
-      `${session.id}-${payment.token}`,
+      `${sessionId}-${payment.token}`,
     );
     ({ pspReference, resultCode, refusalReason } = result);
   } else {
@@ -98,16 +127,17 @@ async function finalize(store: MerchantStore, req: Req): Promise<Res> {
   }
 
   if (resultCode !== "Authorised" || !pspReference) {
+    store.release(approval.items);
     return { status: 200, body: { result_code: resultCode, psp_reference: pspReference, refusal_reason: refusalReason } };
   }
   const order = store.recordOrder({
     id: orderId,
     protocol: "acp",
-    checkoutSessionId: session.id,
+    checkoutSessionId: sessionId,
     pspReference,
-    amount,
-    currency: session.currency,
-    items: session.line_items.map((li) => li.item),
+    amount: approval.total,
+    currency: approval.currency,
+    items: approval.items,
   });
   return {
     status: 200,
