@@ -1,4 +1,6 @@
-# Agentic payments: ACP with Stripe Shared Payment Tokens, Google UCP, and ACP via Adyen
+# Agentic commerce POC: an AI agent shops and pays
+
+ACP with Stripe Shared Payment Tokens (real Stripe test mode), the cart bound to the shopper's approval with Mastercard Verifiable Intent, plus Google UCP and ACP via Adyen (mocked). A chat UI in the browser runs it with Claude Haiku or Gemini.
 
 **Question:** can an AI agent pay a merchant, and how small is the merchant side?
 **Short answer from this repo:** small. An agent purchase ends as one ordinary payment call: a Stripe PaymentIntent confirmed with a Shared Payment Token, or an Adyen `POST /payments`. The **Stripe path runs against the real Stripe test API** (`npm run stripe:live`). The Adyen paths run only against a local mock, because Adyen test signup is closed.
@@ -10,7 +12,8 @@
 > | **Real provider:** a merchant-hosted ACP checkout charges a Stripe Shared Payment Token (SPT) as a real PaymentIntent in Stripe **test mode**, visible in the Dashboard. Refunds go to the real `/v1/refunds` | The SPT is granted by Stripe's **test helper**, standing in for the agent platform (for example OpenAI/ChatGPT). No real agent platform has issued a token to this merchant. Live keys are refused |
 > | Stripe enforces the token's limits: single use, `max_amount`, expiry. A declined card is recoverable with a new token | Stripe webhooks (`payment_intent.*`, `shared_payment.granted_token.deactivated`) are not wired. An unknown outcome is resolved only by the agent's retry |
 > | A merchant backend can expose Google UCP checkout and charge a Google Pay token through Adyen's documented `/payments` shape | No money, test or real, has moved through Adyen. Every `Authorised` comes from the local mock |
-> | The LLM never sees card data or the SPT. The shopper approves the exact total, and a changed total is refused | The default demo has **no LLM**: it uses a scripted keyword matcher. Gemini and Claude run only with an API key |
+> | The LLM never sees card data or the SPT. The shopper approves the exact total, and a changed total is refused | The default demo has **no LLM**: it uses a scripted keyword matcher. Claude (Haiku) and Gemini run only with an API key, for example in the browser UI (`npm run web`) |
+> | **Mastercard Verifiable Intent:** the payment is bound to the cart the shopper approved. A token and signature for one cart cannot pay another; the merchant refuses before charging | The issuer and Mastercard registration are a local mock. Stripe itself does not check the signature |
 > | Unknown outcomes (timeouts, 5xx) never double-charge, on Stripe and Adyen alike. Retries resend the same idempotency key | Google has never called this merchant. Gemini or AI Mode needs Google onboarding and a public HTTPS endpoint |
 > | Each order stores a consent record (what was approved, when, shipped where, paid how) | The approval screen is simulated. In production Google owns it, not the merchant |
 > | Refunds go back to Adyen, and the `REFUND` webhook marks the order refunded (mock) | 3-D Secure is detected but cannot be completed. Capture, disputes and settlement are absent |
@@ -199,19 +202,31 @@ PROTOCOL=stripe npm run demo # merchant-hosted ACP + Stripe (mock Stripe unless 
 npm test                     # 113 tests, all offline: contract, end to end, HMAC vectors, config, LLM loops, Stripe SPT, Verifiable Intent
 ```
 
-To chat with a real agent, start the servers with `npm run servers`. Then, in another terminal:
+### Shop in the browser
 
 ```bash
-GEMINI_API_KEY=... npm run agent -- "2 paket kahve çekirdeği ve filtre kağıdı al"
+PROTOCOL=stripe npm run web  # http://localhost:8090 — chat UI, live cart, payment approval sheet, order card with Stripe Dashboard link
 ```
 
-| `LLM_PROVIDER` | Cost | Key |
-|---|---|---|
-| `gemini` (default when a key is set) | free tier on Google AI Studio, rate limited | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
-| `claude` | paid API usage | `ANTHROPIC_API_KEY` |
-| `scripted` | free, no LLM | none; deterministic keyword matcher used by tests |
+The page runs the agent with the LLM from `.env`, starts the merchant and the mock Mastercard, and binds to `127.0.0.1` only. You chat in any language. The cart panel updates as the agent works. Paying opens an approval sheet showing the exact items, shipping, tax and total. After you approve, the order card shows the Stripe PaymentIntent and the Verifiable Intent checkout hash and intent id.
 
-`GEMINI_MODEL` / `CLAUDE_MODEL` override the model (Gemini default `gemini-3.6-flash`). Each Gemini request times out after 60 s with at most 3 attempts. If Google answers 503 "high demand" or a quota error, switch the model, for example `GEMINI_MODEL=gemini-3.5-flash-lite`. `ADYEN_MODE` (`mock` | `test`), `PROTOCOL` (`ucp` | `acp` | `stripe`) and `MERCHANT_FLOW` (`advanced` | `standard`) reject any other value at startup. `STRIPE_SECRET_KEY` must start with `sk_test_` (real Stripe test API) or be unset (local mock); a `sk_live_` key refuses to start, because live SPTs must come from a real agent platform. `STRIPE_API_BASE` overrides the Stripe host. With `PROTOCOL=stripe`, `npm run servers`, `npm run web` and `npm run stripe:live` also start the mock Mastercard on `MOCK_MASTERCARD_PORT` (default 8084; `MASTERCARD_URL` overrides its URL). `AGENT_PLATFORM_ID` and `MERCHANT_ID` set the L2 audience and the payee id.
+### Chat in the terminal
+
+Start the servers with `npm run servers`. Then, in another terminal:
+
+```bash
+PROTOCOL=stripe npm run agent -- "2 paket kahve çekirdeği ve filtre kağıdı al"
+```
+
+| `LLM_PROVIDER` | Cost | Key | Measured |
+|---|---|---|---|
+| `claude` (default when `ANTHROPIC_API_KEY` is set; model `claude-haiku-5-5`, effort `low`) | paid API usage | `ANTHROPIC_API_KEY` | one purchase in about 9 s |
+| `gemini` (default when only a Gemini key is set) | free tier on Google AI Studio, rate limited | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) | the same purchase in about 94 s on the free tier |
+| `scripted` | free, no LLM | none; deterministic keyword matcher used by tests | |
+
+The timings come from one run each of the same Turkish request against Stripe test mode on 2026-11-21. They are not a benchmark.
+
+`GEMINI_MODEL` / `CLAUDE_MODEL` override the model (Gemini default `gemini-3.6-flash`). `AGENT_CLAUDE_EFFORT` overrides the Claude effort level. Each Gemini request times out after 60 s with at most 3 attempts. If Google answers 503 "high demand" or a quota error, switch the model, for example `GEMINI_MODEL=gemini-3.5-flash-lite`. `ADYEN_MODE` (`mock` | `test`), `PROTOCOL` (`ucp` | `acp` | `stripe`) and `MERCHANT_FLOW` (`advanced` | `standard`) reject any other value at startup. `STRIPE_SECRET_KEY` must start with `sk_test_` (real Stripe test API) or be unset (local mock); a `sk_live_` key refuses to start, because live SPTs must come from a real agent platform. `STRIPE_API_BASE` overrides the Stripe host. With `PROTOCOL=stripe`, `npm run servers`, `npm run web` and `npm run stripe:live` also start the mock Mastercard on `MOCK_MASTERCARD_PORT` (default 8084; `MASTERCARD_URL` overrides its URL). `AGENT_PLATFORM_ID` and `MERCHANT_ID` set the L2 audience and the payee id.
 
 Stripe test PaymentMethods (set `AGENT_STRIPE_PAYMENT_METHOD`, real and mock): `pm_card_visa` succeeds, `pm_card_chargeDeclined` is declined, `pm_card_authenticationRequired` needs 3DS. Adyen mock test cards (set `AGENT_TEST_CARD`): `…1111` is authorised, `…0002` is refused for insufficient balance, and `…0044` triggers a 3-D Secure challenge (UCP: `requires_escalation`). Other things to try in chat: the out-of-stock gooseneck kettle, express shipping, changing quantities, closing the Google Pay sheet.
 
@@ -331,6 +346,8 @@ src/
     acp/                      ACP client (Adyen Commerce Suite or merchant-hosted), Adyen delegate_payment, tools (pay through PaymentAuthority)
     llm/                      Gemini, Claude, scripted agents
     cli.ts, factory.ts, shopper.ts, toolset.ts
+  web/server.ts, index.html   npm run web: chat UI, live cart, approval sheet, order card (SSE)
+  backends.ts, servers.ts     start the merchant and the mocks the chosen protocol needs
 test/ucp.test.ts, acp.test.ts, stripe.test.ts, verifiable-intent.test.ts, unit.test.ts, llm.test.ts, helpers.ts
 ```
 

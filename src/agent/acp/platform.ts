@@ -117,7 +117,7 @@ export class AgentPlatform {
         "request-id": randomUUID(),
         timestamp: new Date().toISOString(),
         "accept-language": "en-US",
-        "user-agent": "adyen-acp-poc/0.1",
+        "user-agent": "agentic-commerce-poc/0.1",
       },
       body: {
         payment_method: {
